@@ -1230,20 +1230,21 @@ def main():
     print(f"User: {args.user}")
     print(f"Organization: {args.org}")
     print(f"Period: {args.year}-{args.month:02d}")
-    print(f"Strategy: {args.strategy}")
-    if tracker.events_coverage != 'none':
+    if args.strategy != 'auto':
+        print(f"Strategy: {args.strategy}")
+    if tracker.events_coverage != 'none' and args.verbose:
         print(f"Events coverage: {tracker.events_coverage}")
-    print(f"Total active days: {len(sorted_days)}")
 
     # API usage stats
     total_invocations = tracker.api_calls.get('total', 0)
     http_requests = tracker.get_http_request_count()
-    if http_requests is not None:
-        print(f"\nGitHub API requests: {http_requests} (across {total_invocations} gh invocations)")
-    else:
-        print(f"\ngh invocations: {total_invocations} total")
-    for cat in sorted(k for k in tracker.api_calls if k != 'total'):
-        print(f"  {cat}: {tracker.api_calls[cat]}")
+    if args.verbose:
+        if http_requests is not None:
+            print(f"\nGitHub API requests: {http_requests} (across {total_invocations} gh invocations)")
+        else:
+            print(f"\ngh invocations: {total_invocations} total")
+        for cat in sorted(k for k in tracker.api_calls if k != 'total'):
+            print(f"  {cat}: {tracker.api_calls[cat]}")
 
     if sorted_days:
         print(f"\nDetailed daily activity:")
