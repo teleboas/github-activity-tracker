@@ -4,9 +4,9 @@ A Python tool to extract activity days for a specific GitHub user within an orga
 
 ## Features
 
-- **Layered Strategy**: Events API -> Search API -> Targeted per-repo fallback for optimal coverage with minimal API calls
+- **Layered Strategy**: Events API -> Search API -> Targeted per-repo fallback for optimal coverage with minimal gh invocations
 - **Comprehensive Activity Detection**: Tracks commits, pull requests (created/merged/closed), issues (created/closed/reopened), comments, PR reviews, wiki edits, releases, branch/tag creation, and forks
-- **Efficient API Usage**: Typically 10-30 API calls vs. 300+ with the legacy approach
+- **Efficient API Usage**: Typically 10-30 gh invocations vs. 300+ with the legacy approach
 - **Coverage Guardrails**: Detects Events API truncation and automatically supplements with search/fallback
 - **Flexible Date Ranges**: Specify any year and month
 - **JSON Output**: Save results in structured format with detailed daily activity breakdown
@@ -47,7 +47,7 @@ python extract_activity_gh.py --org org-name --user username --strategy legacy-r
 # Save results to JSON
 python extract_activity_gh.py --org org-name --user username --output activity_report.json
 
-# Verbose mode shows per-layer progress and API call breakdown
+# Verbose mode shows per-layer progress and invocation breakdown
 python extract_activity_gh.py --org org-name --user username --verbose
 ```
 
@@ -63,7 +63,7 @@ python extract_activity_gh.py --org org-name --user username --verbose
 | `--repo-limit` | Repo limit for `legacy-repos` strategy | 20 |
 | `--include-repos` | Comma-separated repos to always include | |
 | `--output` | Output file for JSON results | |
-| `--verbose` | Show detailed progress and API call stats | |
+| `--verbose` | Show detailed progress and invocation stats | |
 | `--method` | **(Deprecated)** Maps to `--strategy` | |
 
 ## Strategies
@@ -80,7 +80,7 @@ A three-layer pipeline that balances coverage and efficiency:
 
 PR review fallback (the most expensive part) is skipped when Events API coverage is complete.
 
-**Typical API calls: 10-30** (vs. 300+ with `legacy-repos`)
+**Typical gh invocations: 10-30** (vs. 300+ with `legacy-repos`)
 
 ### `events-only`
 
@@ -88,7 +88,7 @@ Events API only. Fastest option but limited to the last 90 days and ~300 events.
 
 ### `search-only`
 
-Search API + targeted per-repo fallback. Works for any date range (no 90-day limit on search queries). Slightly more API calls than `auto` for recent months since it can't skip the PR review fallback.
+Search API + targeted per-repo fallback. Works for any date range (no 90-day limit on search queries). Slightly more gh invocations than `auto` for recent months since it can't skip the PR review fallback.
 
 **Caveat**: Wiki edits and some event types (create/delete/release/fork) are only available through the Events API or the repo events endpoint, which is limited to ~90 days of history. For months older than 90 days, these activity types may be silently missed.
 
@@ -146,7 +146,7 @@ Strategy: auto
 Events coverage: complete
 Total active days: 12
 
-API calls: 18 total
+gh invocations: 18 total
   events: 1
   repo-fallback: 12
   search: 5

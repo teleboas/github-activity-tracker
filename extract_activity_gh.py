@@ -76,7 +76,12 @@ class GitHubActivityTracker:
         return dt
 
     def _run_gh(self, cmd: List[str], category: str = 'general') -> subprocess.CompletedProcess:
-        """Run a gh command and track API calls by category."""
+        """Run a gh command and track invocations by category.
+
+        Note: counts gh CLI invocations, not HTTP requests. A single
+        invocation with --paginate may perform multiple HTTP requests
+        internally.
+        """
         self.api_calls[category] += 1
         self.api_calls['total'] += 1
         return subprocess.run(cmd, capture_output=True, text=True)
@@ -149,6 +154,11 @@ class GitHubActivityTracker:
             self.events_coverage = 'none'
             return set()
 
+        # Check if start_date is outside the retention window (~90 days).
+        # If so, the Events API can only cover the recent portion of the month.
+        retention_cutoff = now - timedelta(days=90)
+        month_straddles_retention = self.start_date < retention_cutoff
+
         activity_days = set()
         earliest_event_date = None
         event_count = 0
@@ -194,13 +204,17 @@ class GitHubActivityTracker:
             self._dispatch_event(event_type, payload, day_str, repo, activity_days)
 
         # Assess coverage
-        # The Events API caps at ~300 events. If we got fewer, we have the
-        # full history within the retention window — even if the earliest
-        # event is after month start (the user was simply inactive earlier).
-        # Only mark partial when we actually hit the cap AND the history
-        # doesn't reach back to month start.
+        # Three reasons events may be incomplete:
+        # 1. API cap (~300 events) hit and earliest event is after month start
+        # 2. Month straddles the ~90-day retention window (start is outside it)
+        # 3. No events returned at all
         if event_count == 0:
             self.events_coverage = 'none'
+        elif month_straddles_retention:
+            self.events_coverage = 'partial'
+            if self.verbose:
+                print(f"  Month start {self._start_str()} is outside ~90-day retention "
+                      f"window (cutoff ~{retention_cutoff.strftime('%Y-%m-%d')}), marking partial")
         elif event_count >= 300 and earliest_event_date and earliest_event_date > self.start_date:
             self.events_coverage = 'partial'
             if self.verbose:
@@ -1039,9 +1053,9 @@ def main():
         print(f"Events coverage: {tracker.events_coverage}")
     print(f"Total active days: {len(sorted_days)}")
 
-    # Per-category API call counts
+    # Per-category gh invocation counts (paginated commands count as one)
     total_calls = tracker.api_calls.get('total', 0)
-    print(f"\nAPI calls: {total_calls} total")
+    print(f"\ngh invocations: {total_calls} total")
     for cat in sorted(k for k in tracker.api_calls if k != 'total'):
         print(f"  {cat}: {tracker.api_calls[cat]}")
 
