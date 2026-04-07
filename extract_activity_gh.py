@@ -840,9 +840,11 @@ class GitHubActivityTracker:
             # Wiki edits — search can't find these
             all_days.update(self._fetch_repo_wiki_edits(repo))
 
-            # PR reviews with accurate timestamps — only when events incomplete
-            if self.events_coverage != 'complete':
-                all_days.update(self._fetch_repo_pr_reviews(repo))
+            # PR reviews — always run. Events can silently drop
+            # PullRequestReviewEvent (cap/retention), and search API
+            # can't provide accurate review dates. The per-repo
+            # /pulls/{n}/reviews endpoint is the only reliable source.
+            all_days.update(self._fetch_repo_pr_reviews(repo))
 
         return all_days
 
