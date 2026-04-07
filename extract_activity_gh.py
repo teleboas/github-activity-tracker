@@ -315,10 +315,12 @@ class GitHubActivityTracker:
         review = payload.get('review', {})
         pr = payload.get('pull_request', {})
         pr_num = pr.get('number')
+        pr_title = (pr.get('title') or '')[:60]
         review_id = review.get('id')
         if pr_num and review_id and self._dedup('reviews', (repo, pr_num, review_id)):
             state = review.get('state', '')
-            self._add_activity(day_str, "PR Review", f"on PR #{pr_num} ({state})", repo)
+            title_part = f": {pr_title}" if pr_title else ""
+            self._add_activity(day_str, "PR Review", f"#{pr_num}{title_part} ({state})", repo)
             activity_days.add(day_str)
 
     def _handle_issues_event(self, payload, day_str, repo, activity_days, _type=None):
@@ -744,21 +746,21 @@ class GitHubActivityTracker:
             'gh', 'api',
             f'repos/{self.org}/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100',
             '--paginate',
-            '--jq', '.[] | {number: .number, updated_at: .updated_at}',
+            '--jq', '.[] | {number: .number, updated_at: .updated_at, title: .title}',
         ]
 
         result = self._run_gh(cmd, category='repo-fallback')
         if result.returncode != 0:
             return activity_days
 
-        candidate_prs = []
+        candidate_prs = {}  # pr_number -> title
         for data in self._parse_lines(result.stdout):
             updated = self._parse_dt(data['updated_at'])
             if updated < self.start_date:
                 break  # sorted desc — everything after is older
-            candidate_prs.append(data['number'])
+            candidate_prs[data['number']] = (data.get('title') or '')[:60]
 
-        for pr_num in candidate_prs:
+        for pr_num, pr_title in candidate_prs.items():
             cmd = [
                 'gh', 'api',
                 f'repos/{self.org}/{repo}/pulls/{pr_num}/reviews',
@@ -784,7 +786,9 @@ class GitHubActivityTracker:
                     continue
                 day_str = dt.strftime('%Y-%m-%d')
                 state = data.get('state', '')
-                self._add_activity(day_str, "PR Review", f"on PR #{pr_num} ({state})", repo)
+                title_part = f": {pr_title}" if pr_title else ""
+                self._add_activity(day_str, "PR Review",
+                                   f"#{pr_num}{title_part} ({state})", repo)
                 activity_days.add(day_str)
 
         return activity_days
