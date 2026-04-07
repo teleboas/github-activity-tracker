@@ -88,7 +88,9 @@ Events API only. Fastest option but limited to the last 90 days and ~300 events.
 
 ### `search-only`
 
-Search API + targeted per-repo fallback. No 90-day limit — works for any date range. Slightly more API calls than `auto` for recent months since it can't skip the PR review fallback.
+Search API + targeted per-repo fallback. Works for any date range (no 90-day limit on search queries). Slightly more API calls than `auto` for recent months since it can't skip the PR review fallback.
+
+**Caveat**: Wiki edits and some event types (create/delete/release/fork) are only available through the Events API or the repo events endpoint, which is limited to ~90 days of history. For months older than 90 days, these activity types may be silently missed.
 
 ### `legacy-repos`
 
@@ -121,6 +123,7 @@ Backward-compatible per-repo crawl. Scans the N most recently updated repos in t
 - **Search API**: Cannot find commit comments, wiki edits, or PR reviews. Cannot determine the exact day a PR was reviewed (only the PR's created/updated date). These gaps are filled by the targeted per-repo fallback.
 - **PR merges by non-authors**: The `merged:` search qualifier finds PRs authored by the user. Merging someone else's PR is only captured via the Events API (PullRequestEvent where the actor is the merger).
 - **Issue triage**: Closing, reopening, and labeling issues is only captured via Events API (IssuesEvent).
+- **Wiki edits**: Only available through Events API or repo events endpoint (~90 days retention). For months older than 90 days, wiki edits are silently missed regardless of strategy.
 - **GitHub Discussions**: Not currently tracked by any layer.
 
 ## Authentication

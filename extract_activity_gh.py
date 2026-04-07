@@ -194,18 +194,18 @@ class GitHubActivityTracker:
             self._dispatch_event(event_type, payload, day_str, repo, activity_days)
 
         # Assess coverage
+        # The Events API caps at ~300 events. If we got fewer, we have the
+        # full history within the retention window — even if the earliest
+        # event is after month start (the user was simply inactive earlier).
+        # Only mark partial when we actually hit the cap AND the history
+        # doesn't reach back to month start.
         if event_count == 0:
             self.events_coverage = 'none'
-        elif event_count >= 300:
-            # Hit the API cap — may have lost events
+        elif event_count >= 300 and earliest_event_date and earliest_event_date > self.start_date:
             self.events_coverage = 'partial'
             if self.verbose:
-                print(f"  Events hit API cap ({event_count} events), marking partial")
-        elif earliest_event_date and earliest_event_date > self.start_date:
-            self.events_coverage = 'partial'
-            if self.verbose:
-                print(f"  Events truncated: earliest={earliest_event_date.strftime('%Y-%m-%d')}, "
-                      f"month starts={self._start_str()}")
+                print(f"  Events hit API cap ({event_count} events) and earliest="
+                      f"{earliest_event_date.strftime('%Y-%m-%d')} > month start, marking partial")
         else:
             self.events_coverage = 'complete'
 
@@ -556,7 +556,12 @@ class GitHubActivityTracker:
     # ═══════════════════════════════════════════════════════════════════
 
     def _fetch_repo_issue_comments(self, repo: str) -> Set[str]:
-        """Fetch issue comments for a repo (uses since filter)."""
+        """Fetch issue/PR conversation comments for a repo (uses since filter).
+
+        The /issues/comments endpoint returns comments on both issues and PRs.
+        We use html_url to distinguish: PR comments contain '/pull/', issue
+        comments contain '/issues/'.
+        """
         activity_days = set()
 
         cmd = [
@@ -564,7 +569,7 @@ class GitHubActivityTracker:
             f'repos/{self.org}/{repo}/issues/comments?since={self._since_iso()}&per_page=100',
             '--paginate',
             '--jq', '.[] | {id: .id, created_at: .created_at, user: .user.login, '
-                    'issue_url: .issue_url}',
+                    'issue_url: .issue_url, html_url: .html_url}',
         ]
 
         result = self._run_gh(cmd, category='repo-fallback')
@@ -582,8 +587,12 @@ class GitHubActivityTracker:
                 continue
             day_str = dt.strftime('%Y-%m-%d')
             issue_url = data.get('issue_url', '')
-            issue_num = issue_url.split('/')[-1] if issue_url else 'unknown'
-            self._add_activity(day_str, "Issue Comment", f"on issue #{issue_num}", repo)
+            html_url = data.get('html_url', '')
+            ref_num = issue_url.split('/')[-1] if issue_url else 'unknown'
+            if '/pull/' in html_url:
+                self._add_activity(day_str, "PR Comment", f"on PR #{ref_num}", repo)
+            else:
+                self._add_activity(day_str, "Issue Comment", f"on issue #{ref_num}", repo)
             activity_days.add(day_str)
 
         return activity_days
@@ -693,10 +702,12 @@ class GitHubActivityTracker:
         """
         activity_days = set()
 
-        # Get PRs sorted by most recently updated (no --paginate: one page of 100 is enough)
+        # Get PRs sorted by most recently updated, paginate to avoid
+        # missing repos with >100 PRs updated in the window.
         cmd = [
             'gh', 'api',
             f'repos/{self.org}/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100',
+            '--paginate',
             '--jq', '.[] | {number: .number, updated_at: .updated_at}',
         ]
 
