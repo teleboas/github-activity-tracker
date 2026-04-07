@@ -51,6 +51,9 @@ class GitHubActivityTracker:
         self.rate_limit_before: Optional[int] = None
         self.rate_limit_after: Optional[int] = None
 
+        # Title cache: (repo, number) -> title, populated from events/search
+        self.title_cache: Dict[tuple, str] = {}
+
         # Repos discovered as touched by the user (populated during execution)
         self.touched_repos: Set[str] = set()
 
@@ -96,6 +99,28 @@ class GitHubActivityTracker:
             return False
         self.seen[category].add(key)
         return True
+
+    def _cache_title(self, repo: str, number: int, title: str):
+        """Store an issue/PR title in the cache."""
+        if title:
+            self.title_cache[(repo, number)] = title[:60]
+
+    def _get_title(self, repo: str, number: int) -> str:
+        """Get an issue/PR title from cache, or fetch it."""
+        key = (repo, number)
+        if key in self.title_cache:
+            return self.title_cache[key]
+        # Fetch from API (works for both issues and PRs)
+        cmd = [
+            'gh', 'api', f'repos/{self.org}/{repo}/issues/{number}',
+            '--jq', '.title',
+        ]
+        result = self._run_gh(cmd, category='repo-fallback')
+        if result.returncode == 0 and result.stdout.strip():
+            title = result.stdout.strip()[:60]
+            self.title_cache[key] = title
+            return title
+        return ''
 
     def _add_activity(self, date_str: str, activity_type: str, details: str, repo: str = None):
         """Record an activity entry for a specific date."""
@@ -290,6 +315,7 @@ class GitHubActivityTracker:
         pr_title = (pr.get('title') or 'Untitled')[:60]
         if not pr_num:
             return
+        self._cache_title(repo, pr_num, pr_title)
 
         if action == 'opened':
             dedup_action = 'created'
@@ -317,6 +343,8 @@ class GitHubActivityTracker:
         pr_num = pr.get('number')
         pr_title = (pr.get('title') or '')[:60]
         review_id = review.get('id')
+        if pr_num:
+            self._cache_title(repo, pr_num, pr_title)
         if pr_num and review_id and self._dedup('reviews', (repo, pr_num, review_id)):
             state = review.get('state', '')
             title_part = f": {pr_title}" if pr_title else ""
@@ -330,6 +358,7 @@ class GitHubActivityTracker:
         issue_title = (issue.get('title') or 'Untitled')[:60]
         if not issue_num:
             return
+        self._cache_title(repo, issue_num, issue_title)
 
         label_map = {
             'opened': "Issue Created",
@@ -347,12 +376,18 @@ class GitHubActivityTracker:
         issue = payload.get('issue', {})
         comment_id = comment.get('id')
         issue_num = issue.get('number')
+        issue_title = (issue.get('title') or '')[:60]
         is_pr = issue.get('pull_request') is not None
+        if issue_num and issue_title:
+            self._cache_title(repo, issue_num, issue_title)
         if comment_id and self._dedup('comments', comment_id):
+            title_part = f": {issue_title}" if issue_title else ""
             if is_pr:
-                self._add_activity(day_str, "PR Comment", f"on PR #{issue_num}", repo)
+                self._add_activity(day_str, "PR Comment",
+                                   f"on PR #{issue_num}{title_part}", repo)
             else:
-                self._add_activity(day_str, "Issue Comment", f"on issue #{issue_num}", repo)
+                self._add_activity(day_str, "Issue Comment",
+                                   f"on issue #{issue_num}{title_part}", repo)
             activity_days.add(day_str)
 
     def _handle_pr_review_comment_event(self, payload, day_str, repo, activity_days, _type=None):
@@ -360,8 +395,13 @@ class GitHubActivityTracker:
         pr = payload.get('pull_request', {})
         comment_id = comment.get('id')
         pr_num = pr.get('number')
+        pr_title = (pr.get('title') or '')[:60]
+        if pr_num:
+            self._cache_title(repo, pr_num, pr_title)
         if comment_id and self._dedup('comments', comment_id):
-            self._add_activity(day_str, "PR Review Comment", f"on PR #{pr_num}", repo)
+            title_part = f": {pr_title}" if pr_title else ""
+            self._add_activity(day_str, "PR Review Comment",
+                               f"on PR #{pr_num}{title_part}", repo)
             activity_days.add(day_str)
 
     def _handle_commit_comment_event(self, payload, day_str, repo, activity_days, _type=None):
@@ -486,6 +526,7 @@ class GitHubActivityTracker:
             day_str = dt.strftime('%Y-%m-%d')
             title = (data.get('title') or 'Untitled')[:60]
             self.touched_repos.add(repo)
+            self._cache_title(repo, pr_num, title)
             self._add_activity(day_str, "PR Created", f"#{pr_num}: {title}", repo)
             activity_days.add(day_str)
 
@@ -521,6 +562,7 @@ class GitHubActivityTracker:
             day_str = dt.strftime('%Y-%m-%d')
             title = (data.get('title') or 'Untitled')[:60]
             self.touched_repos.add(repo)
+            self._cache_title(repo, pr_num, title)
             self._add_activity(day_str, "PR Merged", f"#{pr_num}: {title}", repo)
             activity_days.add(day_str)
 
@@ -555,6 +597,7 @@ class GitHubActivityTracker:
             day_str = dt.strftime('%Y-%m-%d')
             title = (data.get('title') or 'Untitled')[:60]
             self.touched_repos.add(repo)
+            self._cache_title(repo, issue_num, title)
             self._add_activity(day_str, "Issue Created", f"#{issue_num}: {title}", repo)
             activity_days.add(day_str)
 
@@ -614,6 +657,8 @@ class GitHubActivityTracker:
         if result.returncode != 0:
             return activity_days
 
+        # Collect comments first, then batch-resolve titles
+        pending = []
         for data in self._parse_lines(result.stdout):
             if data.get('user') != self.username:
                 continue
@@ -623,14 +668,31 @@ class GitHubActivityTracker:
             dt = self._parse_dt(data['created_at'])
             if not self.in_range(dt):
                 continue
-            day_str = dt.strftime('%Y-%m-%d')
             issue_url = data.get('issue_url', '')
             html_url = data.get('html_url', '')
-            ref_num = issue_url.split('/')[-1] if issue_url else 'unknown'
-            if '/pull/' in html_url:
-                self._add_activity(day_str, "PR Comment", f"on PR #{ref_num}", repo)
+            ref_num_str = issue_url.split('/')[-1] if issue_url else 'unknown'
+            try:
+                ref_num = int(ref_num_str)
+            except ValueError:
+                ref_num = None
+            is_pr = '/pull/' in html_url
+            pending.append((dt.strftime('%Y-%m-%d'), ref_num, is_pr))
+
+        # Batch-resolve unique issue/PR numbers (cache hit = free, miss = 1 API call)
+        unique_nums = {num for _, num, _ in pending if num is not None}
+        for num in unique_nums:
+            if (repo, num) not in self.title_cache:
+                self._get_title(repo, num)
+
+        for day_str, ref_num, is_pr in pending:
+            title = self.title_cache.get((repo, ref_num), '') if ref_num else ''
+            title_part = f": {title}" if title else ""
+            if is_pr:
+                self._add_activity(day_str, "PR Comment",
+                                   f"on PR #{ref_num}{title_part}", repo)
             else:
-                self._add_activity(day_str, "Issue Comment", f"on issue #{ref_num}", repo)
+                self._add_activity(day_str, "Issue Comment",
+                                   f"on issue #{ref_num}{title_part}", repo)
             activity_days.add(day_str)
 
         return activity_days
@@ -651,6 +713,7 @@ class GitHubActivityTracker:
         if result.returncode != 0:
             return activity_days
 
+        pending = []
         for data in self._parse_lines(result.stdout):
             if data.get('user') != self.username:
                 continue
@@ -660,10 +723,24 @@ class GitHubActivityTracker:
             dt = self._parse_dt(data['created_at'])
             if not self.in_range(dt):
                 continue
-            day_str = dt.strftime('%Y-%m-%d')
             pr_url = data.get('pull_request_url', '')
-            pr_num = pr_url.split('/')[-1] if pr_url else 'unknown'
-            self._add_activity(day_str, "PR Review Comment", f"on PR #{pr_num}", repo)
+            pr_num_str = pr_url.split('/')[-1] if pr_url else 'unknown'
+            try:
+                pr_num = int(pr_num_str)
+            except ValueError:
+                pr_num = None
+            pending.append((dt.strftime('%Y-%m-%d'), pr_num))
+
+        unique_nums = {num for _, num in pending if num is not None}
+        for num in unique_nums:
+            if (repo, num) not in self.title_cache:
+                self._get_title(repo, num)
+
+        for day_str, pr_num in pending:
+            title = self.title_cache.get((repo, pr_num), '') if pr_num else ''
+            title_part = f": {title}" if title else ""
+            self._add_activity(day_str, "PR Review Comment",
+                               f"on PR #{pr_num}{title_part}", repo)
             activity_days.add(day_str)
 
         return activity_days
