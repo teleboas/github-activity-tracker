@@ -3,64 +3,125 @@
 GitHub Activity Tracker using GitHub CLI (gh)
 
 Extract activity days for a specific GitHub user in an organization for a given month.
-Uses the GitHub CLI for simpler and more reliable API access.
+Uses a layered strategy: Events API -> Search API -> Targeted per-repo fallback.
 """
 
 import subprocess
 import json
 import argparse
 from datetime import datetime, timedelta, timezone
-from typing import Set, List, Dict
+from typing import Set, List, Dict, Tuple, Optional
 import sys
 from urllib.parse import quote_plus
 from collections import defaultdict
 
 
-class GitHubCLIActivityTracker:
+class GitHubActivityTracker:
+    """Track GitHub activity for a user in an organization."""
+
     def __init__(self, org: str, username: str, year: int, month: int, verbose: bool = False):
         self.org = org
         self.username = username
         self.year = year
         self.month = month
         self.verbose = verbose
-        # Track detailed daily activity
-        self.daily_activity = defaultdict(list)
-        # Global deduplication tracking
-        self.seen_commits = set()  # Track commit SHAs globally
-        self.seen_prs = set()  # Track PR (repo, number) tuples globally
-        # API call counter
-        self.api_call_count = 0
-        # Common variations of the username to search for
-        self.username_variations = [
-            username.lower(),
-            username,
-            username.title(),
-            f"{username.title()} {username.title()}",  # If username is first name only
-        ]
 
-    def get_month_date_range(self) -> tuple:
-        """Get start and end dates for the specified month."""
-        start_date = datetime(self.year, self.month, 1, tzinfo=timezone.utc)
+        # Date range: [start_date, end_date) — half-open interval
+        self.start_date, self.end_date = self._compute_date_range()
 
+        # Detailed daily activity
+        self.daily_activity: Dict[str, List[str]] = defaultdict(list)
+
+        # Unified dedup registry keyed by category
+        self.seen: Dict[str, set] = {
+            'commits': set(),     # commit SHA
+            'prs': set(),         # (repo, pr_number, action) e.g. ('repo', 42, 'created')
+            'issues': set(),      # (repo, issue_number, action)
+            'comments': set(),    # comment id
+            'reviews': set(),     # (repo, pr_number, review_id)
+            'events': set(),      # event id
+            'wiki': set(),        # (repo, page_title, day_str)
+            'releases': set(),    # (repo, tag_name)
+        }
+
+        # Per-category API call tracking
+        self.api_calls: Dict[str, int] = defaultdict(int)
+
+        # Repos discovered as touched by the user (populated during execution)
+        self.touched_repos: Set[str] = set()
+
+        # Events coverage assessment
+        self.events_coverage: str = 'none'  # none, partial, complete
+
+    def _compute_date_range(self) -> Tuple[datetime, datetime]:
+        """Compute [start, end) half-open interval for the target month."""
+        start = datetime(self.year, self.month, 1, tzinfo=timezone.utc)
         if self.month == 12:
-            end_date = datetime(self.year + 1, 1, 1, tzinfo=timezone.utc) - timedelta(days=1)
+            end = datetime(self.year + 1, 1, 1, tzinfo=timezone.utc)
         else:
-            end_date = datetime(self.year, self.month + 1, 1, tzinfo=timezone.utc) - timedelta(days=1)
+            end = datetime(self.year, self.month + 1, 1, tzinfo=timezone.utc)
+        return start, end
 
-        return start_date, end_date
+    def in_range(self, dt: datetime) -> bool:
+        """Check if datetime falls within [start_date, end_date)."""
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return self.start_date <= dt < self.end_date
 
-    def _run_gh_command(self, cmd: List[str], **kwargs) -> subprocess.CompletedProcess:
-        """Run a gh command and track API calls."""
-        self.api_call_count += 1
-        return subprocess.run(cmd, **kwargs)
-    
-    def add_activity(self, date_str: str, activity_type: str, details: str, repo: str = None):
-        """Add detailed activity for a specific date."""
+    def _parse_dt(self, date_str: str) -> datetime:
+        """Parse an ISO datetime string to a timezone-aware datetime."""
+        dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    def _run_gh(self, cmd: List[str], category: str = 'general') -> subprocess.CompletedProcess:
+        """Run a gh command and track API calls by category."""
+        self.api_calls[category] += 1
+        self.api_calls['total'] += 1
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    def _dedup(self, category: str, key) -> bool:
+        """Returns True if this is a NEW item (not seen before). Adds to seen set."""
+        if key in self.seen[category]:
+            return False
+        self.seen[category].add(key)
+        return True
+
+    def _add_activity(self, date_str: str, activity_type: str, details: str, repo: str = None):
+        """Record an activity entry for a specific date."""
         repo_str = f" in {repo}" if repo else ""
-        activity_str = f"{activity_type}: {details}{repo_str}"
-        # Avoid duplicate activity descriptions
-        if activity_str not in self.daily_activity[date_str]:
-            self.daily_activity[date_str].append(activity_str)
+        entry = f"{activity_type}: {details}{repo_str}"
+        if entry not in self.daily_activity[date_str]:
+            self.daily_activity[date_str].append(entry)
+
+    def _repo_short(self, full_repo: str) -> str:
+        """Extract short repo name from org/repo format."""
+        return full_repo.split('/')[-1] if '/' in full_repo else full_repo
+
+    def _search_end_date_str(self) -> str:
+        """Last day of the target month as YYYY-MM-DD (for search qualifiers)."""
+        return (self.end_date - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    def _start_str(self) -> str:
+        return self.start_date.strftime('%Y-%m-%d')
+
+    def _since_iso(self) -> str:
+        return self.start_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    def _until_iso(self) -> str:
+        return self.end_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    def _parse_lines(self, stdout: str):
+        """Yield parsed JSON objects from newline-delimited gh jq output."""
+        for line in stdout.strip().split('\n'):
+            if line and line != 'null':
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+    # ─── Authentication check ───
 
     def check_gh_cli(self) -> bool:
         """Check if GitHub CLI is available and authenticated."""
@@ -68,739 +129,911 @@ class GitHubCLIActivityTracker:
             result = subprocess.run(['gh', 'auth', 'status'], capture_output=True, text=True)
             return result.returncode == 0
         except FileNotFoundError:
-            print("Error: GitHub CLI (gh) not found. Please install it first:")
-            print("  https://cli.github.com/")
+            print("Error: GitHub CLI (gh) not found. Install: https://cli.github.com/")
             return False
 
-    def get_org_repos(self, limit: int = 20) -> List[str]:
-        """Get repository names in the organization (most recently updated first)."""
-        try:
-            cmd = ['gh', 'repo', 'list', self.org, '--json', 'name', '--limit', str(limit)]
-            result = self._run_gh_command(cmd, capture_output=True, text=True, check=True)
-            
-            repos_data = json.loads(result.stdout)
-            return [repo['name'] for repo in repos_data]
-        except subprocess.CalledProcessError as e:
-            if self.verbose:
-                print(f"Error fetching repositories: {e}")
-            return []
-        except json.JSONDecodeError as e:
-            if self.verbose:
-                print(f"Error parsing repository data: {e}")
-            return []
+    # ═══════════════════════════════════════════════════════════════════
+    # Layer 1: Events API
+    # ═══════════════════════════════════════════════════════════════════
 
-    def get_user_activity(self, repo_limit: int = 20, include_repos: List[str] = None) -> Set[str]:
-        """Get all activity days for the user in the organization."""
-        if not self.check_gh_cli():
+    def _fetch_events(self) -> Set[str]:
+        """
+        Primary source: GET /users/{user}/events/orgs/{org}.
+        Returns activity days found. Populates self.touched_repos.
+        Only useful for months within ~90 days of today.
+        """
+        now = datetime.now(timezone.utc)
+        if (now - self.end_date).days > 90:
+            if self.verbose:
+                print("  Target month is >90 days old, skipping Events API")
+            self.events_coverage = 'none'
             return set()
 
         activity_days = set()
-        start_date, end_date = self.get_month_date_range()
+        earliest_event_date = None
+        event_count = 0
+
+        cmd = [
+            'gh', 'api',
+            f'/users/{self.username}/events/orgs/{self.org}?per_page=100',
+            '--paginate',
+            '--jq', '.[]',
+        ]
+
+        result = self._run_gh(cmd, category='events')
+
+        if result.returncode != 0:
+            if self.verbose:
+                print(f"  Events API failed: {result.stderr[:200]}")
+            self.events_coverage = 'none'
+            return set()
+
+        for event in self._parse_lines(result.stdout):
+            event_id = event.get('id')
+            if not event_id or not self._dedup('events', event_id):
+                continue
+
+            event_type = event.get('type', '')
+            created_at_str = event.get('created_at', '')
+            if not created_at_str:
+                continue
+            created_at = self._parse_dt(created_at_str)
+            repo = self._repo_short(event.get('repo', {}).get('name', ''))
+            payload = event.get('payload', {})
+
+            event_count += 1
+            if earliest_event_date is None or created_at < earliest_event_date:
+                earliest_event_date = created_at
+
+            if not self.in_range(created_at):
+                continue
+
+            self.touched_repos.add(repo)
+            day_str = created_at.strftime('%Y-%m-%d')
+
+            self._dispatch_event(event_type, payload, day_str, repo, activity_days)
+
+        # Assess coverage
+        if event_count == 0:
+            self.events_coverage = 'none'
+        elif event_count >= 300:
+            # Hit the API cap — may have lost events
+            self.events_coverage = 'partial'
+            if self.verbose:
+                print(f"  Events hit API cap ({event_count} events), marking partial")
+        elif earliest_event_date and earliest_event_date > self.start_date:
+            self.events_coverage = 'partial'
+            if self.verbose:
+                print(f"  Events truncated: earliest={earliest_event_date.strftime('%Y-%m-%d')}, "
+                      f"month starts={self._start_str()}")
+        else:
+            self.events_coverage = 'complete'
 
         if self.verbose:
-            print(f"Fetching activity using GitHub CLI for {self.username} in {self.org}")
-            print(f"Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+            print(f"  Events API: {event_count} events, {len(activity_days)} active days, "
+                  f"coverage={self.events_coverage}")
+            print(f"  Repos touched: {', '.join(sorted(self.touched_repos)) or 'none'}")
 
-        # Get repositories in the organization (limited to most recent)
-        repos = self.get_org_repos(limit=repo_limit)
+        return activity_days
 
-        # Add any specifically included repos (avoid duplicates)
-        if include_repos:
-            for repo in include_repos:
-                if repo not in repos:
-                    repos.append(repo)
+    def _dispatch_event(self, event_type: str, payload: dict, day_str: str, repo: str,
+                        activity_days: Set[str]):
+        """Route an event to the appropriate handler."""
+        handler = {
+            'PushEvent': self._handle_push_event,
+            'PullRequestEvent': self._handle_pr_event,
+            'PullRequestReviewEvent': self._handle_pr_review_event,
+            'IssuesEvent': self._handle_issues_event,
+            'IssueCommentEvent': self._handle_issue_comment_event,
+            'PullRequestReviewCommentEvent': self._handle_pr_review_comment_event,
+            'CommitCommentEvent': self._handle_commit_comment_event,
+            'GollumEvent': self._handle_gollum_event,
+            'CreateEvent': self._handle_create_event,
+            'DeleteEvent': self._handle_delete_event,
+            'ReleaseEvent': self._handle_release_event,
+            'ForkEvent': self._handle_fork_event,
+            'MemberEvent': self._handle_generic_event,
+            'PublicEvent': self._handle_generic_event,
+        }.get(event_type)
+
+        if handler:
+            handler(payload, day_str, repo, activity_days, event_type)
+
+    def _handle_push_event(self, payload, day_str, repo, activity_days, _type=None):
+        for c in payload.get('commits', []):
+            sha = c.get('sha', '')
+            if self._dedup('commits', sha):
+                msg = c.get('message', '').split('\n')[0][:60]
+                self._add_activity(day_str, "Commit", f"{sha[:7]}: {msg}", repo)
+                activity_days.add(day_str)
+
+    def _handle_pr_event(self, payload, day_str, repo, activity_days, _type=None):
+        action = payload.get('action', '')
+        pr = payload.get('pull_request', {})
+        pr_num = pr.get('number')
+        pr_title = (pr.get('title') or 'Untitled')[:60]
+        if not pr_num:
+            return
+
+        if action == 'opened':
+            dedup_action = 'created'
+            label = "PR Created"
+        elif action == 'closed' and pr.get('merged'):
+            dedup_action = 'merged'
+            label = "PR Merged"
+        elif action == 'closed':
+            dedup_action = 'closed'
+            label = "PR Closed"
+        elif action == 'reopened':
+            dedup_action = 'reopened'
+            label = "PR Reopened"
+        else:
+            dedup_action = action
+            label = f"PR {action.title()}"
+
+        if self._dedup('prs', (repo, pr_num, dedup_action)):
+            self._add_activity(day_str, label, f"#{pr_num}: {pr_title}", repo)
+            activity_days.add(day_str)
+
+    def _handle_pr_review_event(self, payload, day_str, repo, activity_days, _type=None):
+        review = payload.get('review', {})
+        pr = payload.get('pull_request', {})
+        pr_num = pr.get('number')
+        review_id = review.get('id')
+        if pr_num and review_id and self._dedup('reviews', (repo, pr_num, review_id)):
+            state = review.get('state', '')
+            self._add_activity(day_str, "PR Review", f"on PR #{pr_num} ({state})", repo)
+            activity_days.add(day_str)
+
+    def _handle_issues_event(self, payload, day_str, repo, activity_days, _type=None):
+        action = payload.get('action', '')
+        issue = payload.get('issue', {})
+        issue_num = issue.get('number')
+        issue_title = (issue.get('title') or 'Untitled')[:60]
+        if not issue_num:
+            return
+
+        label_map = {
+            'opened': "Issue Created",
+            'closed': "Issue Closed",
+            'reopened': "Issue Reopened",
+        }
+        label = label_map.get(action, f"Issue {action.title()}")
+
+        if self._dedup('issues', (repo, issue_num, action)):
+            self._add_activity(day_str, label, f"#{issue_num}: {issue_title}", repo)
+            activity_days.add(day_str)
+
+    def _handle_issue_comment_event(self, payload, day_str, repo, activity_days, _type=None):
+        comment = payload.get('comment', {})
+        issue = payload.get('issue', {})
+        comment_id = comment.get('id')
+        issue_num = issue.get('number')
+        is_pr = issue.get('pull_request') is not None
+        if comment_id and self._dedup('comments', comment_id):
+            if is_pr:
+                self._add_activity(day_str, "PR Comment", f"on PR #{issue_num}", repo)
+            else:
+                self._add_activity(day_str, "Issue Comment", f"on issue #{issue_num}", repo)
+            activity_days.add(day_str)
+
+    def _handle_pr_review_comment_event(self, payload, day_str, repo, activity_days, _type=None):
+        comment = payload.get('comment', {})
+        pr = payload.get('pull_request', {})
+        comment_id = comment.get('id')
+        pr_num = pr.get('number')
+        if comment_id and self._dedup('comments', comment_id):
+            self._add_activity(day_str, "PR Review Comment", f"on PR #{pr_num}", repo)
+            activity_days.add(day_str)
+
+    def _handle_commit_comment_event(self, payload, day_str, repo, activity_days, _type=None):
+        comment = payload.get('comment', {})
+        comment_id = comment.get('id')
+        commit_id = comment.get('commit_id', '')[:7]
+        if comment_id and self._dedup('comments', comment_id):
+            self._add_activity(day_str, "Commit Comment", f"on commit {commit_id}", repo)
+            activity_days.add(day_str)
+
+    def _handle_gollum_event(self, payload, day_str, repo, activity_days, _type=None):
+        for page in payload.get('pages', []):
+            title = page.get('title', page.get('page_name', 'Unknown'))
+            action = page.get('action', 'edited')
+            if self._dedup('wiki', (repo, title, day_str)):
+                self._add_activity(day_str, "Wiki Edit", f"{action} '{title}'", repo)
+                activity_days.add(day_str)
+
+    def _handle_create_event(self, payload, day_str, repo, activity_days, _type=None):
+        ref_type = payload.get('ref_type', '')
+        ref = payload.get('ref', '')
+        if ref_type in ('branch', 'tag'):
+            self._add_activity(day_str, f"{ref_type.title()} Created", ref or '(default)', repo)
+            activity_days.add(day_str)
+        elif ref_type == 'repository':
+            self._add_activity(day_str, "Repo Created", repo)
+            activity_days.add(day_str)
+
+    def _handle_delete_event(self, payload, day_str, repo, activity_days, _type=None):
+        ref_type = payload.get('ref_type', '')
+        ref = payload.get('ref', '')
+        if ref_type in ('branch', 'tag'):
+            self._add_activity(day_str, f"{ref_type.title()} Deleted", ref, repo)
+            activity_days.add(day_str)
+
+    def _handle_release_event(self, payload, day_str, repo, activity_days, _type=None):
+        release = payload.get('release', {})
+        tag = release.get('tag_name', '')
+        name = (release.get('name') or tag)[:60]
+        action = payload.get('action', 'published')
+        if self._dedup('releases', (repo, tag)):
+            self._add_activity(day_str, "Release", f"{action} {name}", repo)
+            activity_days.add(day_str)
+
+    def _handle_fork_event(self, payload, day_str, repo, activity_days, _type=None):
+        forkee = payload.get('forkee', {})
+        fork_name = forkee.get('full_name', '')
+        self._add_activity(day_str, "Fork", f"created {fork_name}", repo)
+        activity_days.add(day_str)
+
+    def _handle_generic_event(self, payload, day_str, repo, activity_days, event_type=None):
+        label = (event_type or '').replace('Event', '')
+        action = payload.get('action', '')
+        self._add_activity(day_str, label, action, repo)
+        activity_days.add(day_str)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Layer 2: Search supplements
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _search_commits(self) -> Set[str]:
+        """Search for commits by this user in the org."""
+        activity_days = set()
+        query = (f'org:{self.org} author:{self.username} '
+                 f'committer-date:{self._start_str()}..{self._search_end_date_str()}')
+
+        cmd = [
+            'gh', 'api', f'search/commits?q={quote_plus(query)}&per_page=100',
+            '--paginate',
+            '--jq', '.items[] | {sha: .sha, date: .commit.author.date, '
+                    'message: .commit.message, repo: .repository.name}',
+        ]
+
+        result = self._run_gh(cmd, category='search')
+        if result.returncode != 0:
+            if self.verbose:
+                print(f"  Commit search failed: {result.stderr[:200]}")
+            return activity_days
+
+        for data in self._parse_lines(result.stdout):
+            sha = data.get('sha', '')
+            if not self._dedup('commits', sha):
+                continue
+            dt = self._parse_dt(data['date'])
+            if not self.in_range(dt):
+                continue
+            day_str = dt.strftime('%Y-%m-%d')
+            msg = data.get('message', '').split('\n')[0][:60]
+            repo = data.get('repo', 'unknown')
+            self.touched_repos.add(repo)
+            self._add_activity(day_str, "Commit", f"{sha[:7]}: {msg}", repo)
+            activity_days.add(day_str)
 
         if self.verbose:
-            print(f"Checking {len(repos)} repositories in {self.org}")
+            print(f"  Commit search: {len(activity_days)} active days")
+        return activity_days
 
-        for repo_name in repos:
-            if self.verbose:
-                print(f"Checking repository: {repo_name}")
+    def _search_prs_created(self) -> Set[str]:
+        """Search for PRs created by this user."""
+        activity_days = set()
+        query = (f'org:{self.org} author:{self.username} type:pr '
+                 f'created:{self._start_str()}..{self._search_end_date_str()}')
 
-            # Get commits
-            commits_days = self._get_commits_for_repo(repo_name, start_date, end_date)
-            activity_days.update(commits_days)
+        cmd = [
+            'gh', 'api', f'search/issues?q={quote_plus(query)}&per_page=100',
+            '--paginate',
+            '--jq', '.items[] | {number, created_at, title, repo: .repository_url}',
+        ]
 
-            # Get pull requests
-            pr_days = self._get_prs_for_repo(repo_name, start_date, end_date)
-            activity_days.update(pr_days)
+        result = self._run_gh(cmd, category='search')
+        if result.returncode != 0:
+            return activity_days
 
-            # Get issues created
-            issue_days = self._get_issues_for_repo(repo_name, start_date, end_date)
-            activity_days.update(issue_days)
+        for data in self._parse_lines(result.stdout):
+            pr_num = data.get('number')
+            repo = self._repo_short(data.get('repo', ''))
+            if not self._dedup('prs', (repo, pr_num, 'created')):
+                continue
+            dt = self._parse_dt(data['created_at'])
+            if not self.in_range(dt):
+                continue
+            day_str = dt.strftime('%Y-%m-%d')
+            title = (data.get('title') or 'Untitled')[:60]
+            self.touched_repos.add(repo)
+            self._add_activity(day_str, "PR Created", f"#{pr_num}: {title}", repo)
+            activity_days.add(day_str)
 
-            # Get issue comments
-            issue_comment_days = self._get_issue_comments_for_repo(repo_name, start_date, end_date)
-            activity_days.update(issue_comment_days)
+        if self.verbose:
+            print(f"  PR created search: {len(activity_days)} active days")
+        return activity_days
 
-            # Get PR comments
-            pr_comment_days = self._get_pr_comments_for_repo(repo_name, start_date, end_date)
-            activity_days.update(pr_comment_days)
+    def _search_prs_merged(self) -> Set[str]:
+        """Search for PRs merged by this user."""
+        activity_days = set()
+        query = (f'org:{self.org} author:{self.username} type:pr is:merged '
+                 f'merged:{self._start_str()}..{self._search_end_date_str()}')
 
-            # Get commit comments
-            commit_comment_days = self._get_commit_comments_for_repo(repo_name, start_date, end_date)
-            activity_days.update(commit_comment_days)
+        cmd = [
+            'gh', 'api', f'search/issues?q={quote_plus(query)}&per_page=100',
+            '--paginate',
+            '--jq', '.items[] | {number, closed_at, title, repo: .repository_url}',
+        ]
 
-            # Get wiki edits
-            wiki_days = self._get_wiki_edits_for_repo(repo_name, start_date, end_date)
-            activity_days.update(wiki_days)
+        result = self._run_gh(cmd, category='search')
+        if result.returncode != 0:
+            return activity_days
+
+        for data in self._parse_lines(result.stdout):
+            pr_num = data.get('number')
+            repo = self._repo_short(data.get('repo', ''))
+            if not self._dedup('prs', (repo, pr_num, 'merged')):
+                continue
+            # closed_at ≈ merged_at for merged PRs
+            dt = self._parse_dt(data.get('closed_at') or data.get('created_at', ''))
+            if not self.in_range(dt):
+                continue
+            day_str = dt.strftime('%Y-%m-%d')
+            title = (data.get('title') or 'Untitled')[:60]
+            self.touched_repos.add(repo)
+            self._add_activity(day_str, "PR Merged", f"#{pr_num}: {title}", repo)
+            activity_days.add(day_str)
+
+        if self.verbose:
+            print(f"  PR merged search: {len(activity_days)} active days")
+        return activity_days
+
+    def _search_issues(self) -> Set[str]:
+        """Search for issues created by this user."""
+        activity_days = set()
+        query = (f'org:{self.org} author:{self.username} type:issue '
+                 f'created:{self._start_str()}..{self._search_end_date_str()}')
+
+        cmd = [
+            'gh', 'api', f'search/issues?q={quote_plus(query)}&per_page=100',
+            '--paginate',
+            '--jq', '.items[] | {number, created_at, title, repo: .repository_url}',
+        ]
+
+        result = self._run_gh(cmd, category='search')
+        if result.returncode != 0:
+            return activity_days
+
+        for data in self._parse_lines(result.stdout):
+            issue_num = data.get('number')
+            repo = self._repo_short(data.get('repo', ''))
+            if not self._dedup('issues', (repo, issue_num, 'opened')):
+                continue
+            dt = self._parse_dt(data['created_at'])
+            if not self.in_range(dt):
+                continue
+            day_str = dt.strftime('%Y-%m-%d')
+            title = (data.get('title') or 'Untitled')[:60]
+            self.touched_repos.add(repo)
+            self._add_activity(day_str, "Issue Created", f"#{issue_num}: {title}", repo)
+            activity_days.add(day_str)
+
+        if self.verbose:
+            print(f"  Issue search: {len(activity_days)} active days")
+        return activity_days
+
+    def _search_involved_repos(self) -> Set[str]:
+        """
+        Use involves: search to discover repos where user participated.
+        For REPO DISCOVERY only — not day attribution.
+        """
+        repos = set()
+        query = (f'org:{self.org} involves:{self.username} '
+                 f'updated:{self._start_str()}..{self._search_end_date_str()}')
+
+        cmd = [
+            'gh', 'api', f'search/issues?q={quote_plus(query)}&per_page=100',
+            '--paginate',
+            '--jq', '.items[] | .repository_url',
+        ]
+
+        result = self._run_gh(cmd, category='search')
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                if line and line != 'null':
+                    repos.add(line.strip().split('/')[-1])
+
+        if self.verbose:
+            new_repos = repos - self.touched_repos
+            print(f"  Involved repos search: {len(repos)} repos ({len(new_repos)} new)")
+
+        return repos
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Layer 3: Targeted per-repo fallback
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _fetch_repo_issue_comments(self, repo: str) -> Set[str]:
+        """Fetch issue comments for a repo (uses since filter)."""
+        activity_days = set()
+
+        cmd = [
+            'gh', 'api',
+            f'repos/{self.org}/{repo}/issues/comments?since={self._since_iso()}&per_page=100',
+            '--paginate',
+            '--jq', '.[] | {id: .id, created_at: .created_at, user: .user.login, '
+                    'issue_url: .issue_url}',
+        ]
+
+        result = self._run_gh(cmd, category='repo-fallback')
+        if result.returncode != 0:
+            return activity_days
+
+        for data in self._parse_lines(result.stdout):
+            if data.get('user') != self.username:
+                continue
+            comment_id = data.get('id')
+            if not self._dedup('comments', comment_id):
+                continue
+            dt = self._parse_dt(data['created_at'])
+            if not self.in_range(dt):
+                continue
+            day_str = dt.strftime('%Y-%m-%d')
+            issue_url = data.get('issue_url', '')
+            issue_num = issue_url.split('/')[-1] if issue_url else 'unknown'
+            self._add_activity(day_str, "Issue Comment", f"on issue #{issue_num}", repo)
+            activity_days.add(day_str)
 
         return activity_days
 
-    def _get_wiki_edits_for_repo(self, repo_name: str, start_date: datetime, end_date: datetime) -> Set[str]:
-        """Get wiki edit days for the user in a specific repository."""
+    def _fetch_repo_pr_review_comments(self, repo: str) -> Set[str]:
+        """Fetch inline PR review comments for a repo (uses since filter)."""
         activity_days = set()
 
-        try:
-            # Get repository events and filter for GollumEvent (wiki edits)
+        cmd = [
+            'gh', 'api',
+            f'repos/{self.org}/{repo}/pulls/comments?since={self._since_iso()}&per_page=100',
+            '--paginate',
+            '--jq', '.[] | {id: .id, created_at: .created_at, user: .user.login, '
+                    'pull_request_url: .pull_request_url}',
+        ]
+
+        result = self._run_gh(cmd, category='repo-fallback')
+        if result.returncode != 0:
+            return activity_days
+
+        for data in self._parse_lines(result.stdout):
+            if data.get('user') != self.username:
+                continue
+            comment_id = data.get('id')
+            if not self._dedup('comments', comment_id):
+                continue
+            dt = self._parse_dt(data['created_at'])
+            if not self.in_range(dt):
+                continue
+            day_str = dt.strftime('%Y-%m-%d')
+            pr_url = data.get('pull_request_url', '')
+            pr_num = pr_url.split('/')[-1] if pr_url else 'unknown'
+            self._add_activity(day_str, "PR Review Comment", f"on PR #{pr_num}", repo)
+            activity_days.add(day_str)
+
+        return activity_days
+
+    def _fetch_repo_commit_comments(self, repo: str) -> Set[str]:
+        """Fetch commit comments for a repo (no since filter available)."""
+        activity_days = set()
+
+        cmd = [
+            'gh', 'api',
+            f'repos/{self.org}/{repo}/comments?per_page=100',
+            '--paginate',
+            '--jq', '.[] | {id: .id, created_at: .created_at, user: .user.login, '
+                    'commit_id: .commit_id}',
+        ]
+
+        result = self._run_gh(cmd, category='repo-fallback')
+        if result.returncode != 0:
+            return activity_days
+
+        for data in self._parse_lines(result.stdout):
+            if data.get('user') != self.username:
+                continue
+            comment_id = data.get('id')
+            if not self._dedup('comments', comment_id):
+                continue
+            dt = self._parse_dt(data['created_at'])
+            if not self.in_range(dt):
+                continue
+            day_str = dt.strftime('%Y-%m-%d')
+            commit_id = data.get('commit_id', 'unknown')[:7]
+            self._add_activity(day_str, "Commit Comment", f"on commit {commit_id}", repo)
+            activity_days.add(day_str)
+
+        return activity_days
+
+    def _fetch_repo_wiki_edits(self, repo: str) -> Set[str]:
+        """Fetch wiki edits via the repo events endpoint."""
+        activity_days = set()
+
+        cmd = [
+            'gh', 'api', f'repos/{self.org}/{repo}/events?per_page=100',
+            '--paginate',
+            '--jq', '.[] | select(.type == "GollumEvent") | '
+                    '{id: .id, actor: .actor.login, created_at: .created_at, '
+                    'pages: .payload.pages}',
+        ]
+
+        result = self._run_gh(cmd, category='repo-fallback')
+        if result.returncode != 0:
+            return activity_days
+
+        for data in self._parse_lines(result.stdout):
+            if data.get('actor') != self.username:
+                continue
+            dt = self._parse_dt(data['created_at'])
+            if not self.in_range(dt):
+                continue
+            day_str = dt.strftime('%Y-%m-%d')
+            for page in data.get('pages', []):
+                title = page.get('title', page.get('page_name', 'Unknown'))
+                action = page.get('action', 'edited')
+                if self._dedup('wiki', (repo, title, day_str)):
+                    self._add_activity(day_str, "Wiki Edit", f"{action} '{title}'", repo)
+                    activity_days.add(day_str)
+
+        return activity_days
+
+    def _fetch_repo_pr_reviews(self, repo: str) -> Set[str]:
+        """
+        Fetch PR reviews with accurate timestamps.
+        Lists recently-updated PRs, then fetches reviews for each candidate.
+        Breaks early when PRs are older than our window.
+        """
+        activity_days = set()
+
+        # Get PRs sorted by most recently updated (no --paginate: one page of 100 is enough)
+        cmd = [
+            'gh', 'api',
+            f'repos/{self.org}/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100',
+            '--jq', '.[] | {number: .number, updated_at: .updated_at}',
+        ]
+
+        result = self._run_gh(cmd, category='repo-fallback')
+        if result.returncode != 0:
+            return activity_days
+
+        candidate_prs = []
+        for data in self._parse_lines(result.stdout):
+            updated = self._parse_dt(data['updated_at'])
+            if updated < self.start_date:
+                break  # sorted desc — everything after is older
+            candidate_prs.append(data['number'])
+
+        for pr_num in candidate_prs:
             cmd = [
-                'gh', 'api', f'repos/{self.org}/{repo_name}/events',
-                '--paginate',
-                '--jq', '.[] | select(.type == "GollumEvent") | {actor: .actor.login, created_at: .created_at, pages: .payload.pages}'
+                'gh', 'api',
+                f'repos/{self.org}/{repo}/pulls/{pr_num}/reviews',
+                '--jq', '.[] | {id: .id, user: .user.login, submitted_at: .submitted_at, '
+                        'state: .state}',
             ]
 
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
+            result = self._run_gh(cmd, category='repo-fallback')
+            if result.returncode != 0:
+                continue
 
-            if result.returncode == 0:
-                wiki_edit_count = 0
-                for line in result.stdout.strip().split('\n'):
-                    if line and line != 'null':
-                        try:
-                            event_data = json.loads(line)
-                            actor = event_data.get('actor', '')
-
-                            # Check if this edit is by our user
-                            if actor == self.username:
-                                event_date = datetime.fromisoformat(event_data['created_at'].replace('Z', '+00:00'))
-
-                                # Filter by date range
-                                if start_date <= event_date <= end_date:
-                                    day_str = event_date.strftime('%Y-%m-%d')
-                                    activity_days.add(day_str)
-
-                                    # Get page names from the event
-                                    pages = event_data.get('pages', [])
-                                    for page in pages:
-                                        page_name = page.get('title', page.get('page_name', 'Unknown'))
-                                        action = page.get('action', 'edited')
-                                        self.add_activity(day_str, "Wiki Edit", f"{action} '{page_name}'", repo_name)
-
-                                    wiki_edit_count += 1
-
-                        except (json.JSONDecodeError, KeyError) as e:
-                            continue
-
-                if wiki_edit_count > 0 and self.verbose:
-                    print(f"  → Found {wiki_edit_count} wiki edits by {self.username}")
-
-        except subprocess.CalledProcessError:
-            pass
-        except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking wiki edits in {repo_name}: {e}")
+            for data in self._parse_lines(result.stdout):
+                if data.get('user') != self.username:
+                    continue
+                review_id = data.get('id')
+                if not self._dedup('reviews', (repo, pr_num, review_id)):
+                    continue
+                submitted = data.get('submitted_at')
+                if not submitted:
+                    continue
+                dt = self._parse_dt(submitted)
+                if not self.in_range(dt):
+                    continue
+                day_str = dt.strftime('%Y-%m-%d')
+                state = data.get('state', '')
+                self._add_activity(day_str, "PR Review", f"on PR #{pr_num} ({state})", repo)
+                activity_days.add(day_str)
 
         return activity_days
 
-    def _get_commits_for_repo(self, repo_name: str, start_date: datetime, end_date: datetime) -> Set[str]:
-        """Get commit days for the user in a specific repository."""
-        activity_days = set()
-        
-        try:
-            # Get recent commits and filter by date and author locally
+    # ═══════════════════════════════════════════════════════════════════
+    # Strategy orchestration
+    # ═══════════════════════════════════════════════════════════════════
+
+    def run_auto(self, include_repos: List[str] = None) -> Set[str]:
+        """
+        Default layered strategy:
+        Events API -> Search supplements -> Targeted per-repo fallback.
+        """
+        all_days = set()
+        include_repos = include_repos or []
+
+        # Layer 1: Events API
+        if self.verbose:
+            print("=== Layer 1: Events API ===")
+        all_days.update(self._fetch_events())
+
+        # Layer 2: Search supplements
+        if self.verbose:
+            print("\n=== Layer 2: Search Supplements ===")
+        all_days.update(self._search_commits())
+        all_days.update(self._search_prs_created())
+        all_days.update(self._search_prs_merged())
+        all_days.update(self._search_issues())
+
+        # Discover repos via involves: search
+        involved_repos = self._search_involved_repos()
+        self.touched_repos.update(involved_repos)
+
+        # Add explicitly included repos
+        for repo in include_repos:
+            self.touched_repos.add(repo)
+
+        # Layer 3: Targeted per-repo fallback
+        if self.verbose:
+            print(f"\n=== Layer 3: Targeted Fallback ({len(self.touched_repos)} repos) ===")
+
+        for repo in sorted(self.touched_repos):
+            if self.verbose:
+                print(f"  Scanning {repo}...")
+
+            # Comments (search can miss involvement-only comments)
+            all_days.update(self._fetch_repo_issue_comments(repo))
+            all_days.update(self._fetch_repo_pr_review_comments(repo))
+
+            # Commit comments — search can't find these
+            all_days.update(self._fetch_repo_commit_comments(repo))
+
+            # Wiki edits — search can't find these
+            all_days.update(self._fetch_repo_wiki_edits(repo))
+
+            # PR reviews with accurate timestamps — only when events incomplete
+            if self.events_coverage != 'complete':
+                all_days.update(self._fetch_repo_pr_reviews(repo))
+
+        return all_days
+
+    def run_events_only(self) -> Set[str]:
+        """Events API only — fast, limited to last 90 days."""
+        if self.verbose:
+            print("=== Strategy: events-only ===")
+        return self._fetch_events()
+
+    def run_search_only(self, include_repos: List[str] = None) -> Set[str]:
+        """Search API + targeted fallback (no events). Works for any date range."""
+        all_days = set()
+        include_repos = include_repos or []
+
+        if self.verbose:
+            print("=== Strategy: search-only ===")
+
+        all_days.update(self._search_commits())
+        all_days.update(self._search_prs_created())
+        all_days.update(self._search_prs_merged())
+        all_days.update(self._search_issues())
+
+        involved_repos = self._search_involved_repos()
+        self.touched_repos.update(involved_repos)
+        for repo in include_repos:
+            self.touched_repos.add(repo)
+
+        if self.verbose:
+            print(f"\n  Targeted fallback for {len(self.touched_repos)} repos")
+
+        for repo in sorted(self.touched_repos):
+            if self.verbose:
+                print(f"  Scanning {repo}...")
+            all_days.update(self._fetch_repo_issue_comments(repo))
+            all_days.update(self._fetch_repo_pr_review_comments(repo))
+            all_days.update(self._fetch_repo_commit_comments(repo))
+            all_days.update(self._fetch_repo_wiki_edits(repo))
+            all_days.update(self._fetch_repo_pr_reviews(repo))
+
+        return all_days
+
+    def run_legacy_repos(self, repo_limit: int = 20, include_repos: List[str] = None) -> Set[str]:
+        """
+        Legacy per-repo crawl (backward compat / debug).
+        Still uses corrected date handling and server-side filters.
+        """
+        all_days = set()
+        include_repos = include_repos or []
+
+        if self.verbose:
+            print("=== Strategy: legacy-repos ===")
+
+        cmd = ['gh', 'repo', 'list', self.org, '--json', 'name', '--limit', str(repo_limit)]
+        result = self._run_gh(cmd, category='repo-fallback')
+
+        repos = []
+        if result.returncode == 0:
+            try:
+                repos = [r['name'] for r in json.loads(result.stdout)]
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        for repo in include_repos:
+            if repo not in repos:
+                repos.append(repo)
+
+        if self.verbose:
+            print(f"  Scanning {len(repos)} repositories")
+
+        for repo in repos:
+            if self.verbose:
+                print(f"  Scanning {repo}...")
+
+            # Commits with server-side author + since + until
             cmd = [
-                'gh', 'api', 
-                f'repos/{self.org}/{repo_name}/commits?per_page=100',
+                'gh', 'api',
+                f'repos/{self.org}/{repo}/commits?author={self.username}'
+                f'&since={self._since_iso()}&until={self._until_iso()}&per_page=100',
                 '--paginate',
-                '--jq', '.[] | {date: .commit.author.date, name: .commit.author.name, email: .commit.author.email, sha: .sha, message: .commit.message}'
+                '--jq', '.[] | {sha: .sha, date: .commit.author.date, '
+                        'message: .commit.message}',
             ]
-            
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-            
+            result = self._run_gh(cmd, category='repo-fallback')
             if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')
-                commit_count = 0
-                for line in lines:
-                    if line and line != 'null':
-                        try:
-                            commit_data = json.loads(line)
-                            author_name = commit_data.get('name', '').strip()
-                            author_email = commit_data.get('email', '').strip()
-                            commit_sha = commit_data.get('sha', '')  # Full hash for deduplication
-                            commit_message = commit_data.get('message', '').split('\n')[0][:60]  # First line, truncated
+                for data in self._parse_lines(result.stdout):
+                    sha = data.get('sha', '')
+                    if not self._dedup('commits', sha):
+                        continue
+                    dt = self._parse_dt(data['date'])
+                    if not self.in_range(dt):
+                        continue
+                    day_str = dt.strftime('%Y-%m-%d')
+                    msg = data.get('message', '').split('\n')[0][:60]
+                    self._add_activity(day_str, "Commit", f"{sha[:7]}: {msg}", repo)
+                    all_days.add(day_str)
 
-                            # Check if this commit is by our user (any variation)
-                            is_user_commit = (
-                                author_name in self.username_variations or
-                                author_email.split('@')[0].lower() == self.username.lower() or
-                                self.username.lower() in author_name.lower()
-                            )
-
-                            if is_user_commit:
-                                # Check if we've already seen this commit globally
-                                if commit_sha in self.seen_commits:
-                                    continue
-                                self.seen_commits.add(commit_sha)
-
-                                commit_date = datetime.fromisoformat(commit_data['date'].replace('Z', '+00:00'))
-                                # Filter by date range locally
-                                if start_date <= commit_date <= end_date:
-                                    day_str = commit_date.strftime('%Y-%m-%d')
-                                    activity_days.add(day_str)
-                                    # Record detailed activity (use short hash for display)
-                                    short_sha = commit_sha[:7]
-                                    self.add_activity(day_str, "Commit", f"{short_sha}: {commit_message}", repo_name)
-                                    commit_count += 1
-                                
-                        except (json.JSONDecodeError, KeyError) as e:
-                            continue
-                
-                if commit_count > 0 and self.verbose:
-                    print(f"  → Found {commit_count} commits by {self.username}")
-
-        except subprocess.CalledProcessError:
-            # Repository might not exist or no access
-            pass
-        except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking commits in {repo_name}: {e}")
-        
-        return activity_days
-
-    def _get_prs_for_repo(self, repo_name: str, start_date: datetime, end_date: datetime) -> Set[str]:
-        """Get pull request creation and review days for the user in a specific repository."""
-        activity_days = set()
-        
-        # Get PRs created by the user
-        try:
+            # PRs created
             cmd = [
                 'gh', 'pr', 'list',
-                '--repo', f'{self.org}/{repo_name}',
+                '--repo', f'{self.org}/{repo}',
                 '--author', self.username,
                 '--state', 'all',
                 '--json', 'createdAt,title,number',
-                '--limit', '1000'
+                '--limit', '1000',
             ]
-            
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-            
+            result = self._run_gh(cmd, category='repo-fallback')
             if result.returncode == 0:
-                prs_data = json.loads(result.stdout) if result.stdout.strip() else []
-                
-                for pr in prs_data:
-                    pr_number = pr.get('number')
-                    pr_key = (repo_name, pr_number)
-                    
-                    # Check if we've already seen this PR globally
-                    if pr_key in self.seen_prs:
-                        continue
-                    self.seen_prs.add(pr_key)
-                    
-                    pr_date = datetime.fromisoformat(pr['createdAt'].replace('Z', '+00:00'))
-                    if pr_date.tzinfo is None:
-                        pr_date = pr_date.replace(tzinfo=timezone.utc)
-                    if start_date <= pr_date <= end_date:
-                        day_str = pr_date.strftime('%Y-%m-%d')
-                        activity_days.add(day_str)
-                        pr_title = pr.get('title', 'Untitled')[:60]
-                        self.add_activity(day_str, "PR Created", f"#{pr_number}: {pr_title}", repo_name)
-            
-        except subprocess.CalledProcessError:
-            pass
-        except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking PRs in {repo_name}: {e}")
-        
-        # Get PR reviews by the user
-        try:
-            # Get all PRs and check for reviews by our user
-            cmd = [
-                'gh', 'api', f'repos/{self.org}/{repo_name}/pulls?state=all',
-                '--paginate',
-                '--jq', '.[] | {number: .number, updated_at: .updated_at}'
-            ]
-            
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
-                    if line and line != 'null':
-                        try:
-                            pr_data = json.loads(line)
-                            pr_number = pr_data['number']
-                            updated_at = datetime.fromisoformat(pr_data['updated_at'].replace('Z', '+00:00'))
-                            
-                            # Only check PRs updated in our date range
-                            if start_date <= updated_at <= end_date:
-                                review_days = self._get_reviews_for_pr(repo_name, pr_number, start_date, end_date)
-                                activity_days.update(review_days)
-                                
-                        except (json.JSONDecodeError, KeyError):
+                try:
+                    prs = json.loads(result.stdout) if result.stdout.strip() else []
+                    for pr in prs:
+                        pr_num = pr.get('number')
+                        if not self._dedup('prs', (repo, pr_num, 'created')):
                             continue
-            
-        except subprocess.CalledProcessError:
-            pass
-        except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking PR reviews in {repo_name}: {e}")
-        
-        return activity_days
-    
-    def _get_reviews_for_pr(self, repo_name: str, pr_number: int, start_date: datetime, end_date: datetime) -> Set[str]:
-        """Get review days for a specific PR."""
-        review_days = set()
-        
-        try:
-            cmd = [
-                'gh', 'api', f'repos/{self.org}/{repo_name}/pulls/{pr_number}/reviews',
-                '--jq', '.[] | {user: .user.login, submitted_at: .submitted_at}'
-            ]
-            
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
-                    if line and line != 'null':
-                        try:
-                            review_data = json.loads(line)
-                            reviewer = review_data.get('user', '')
-                            submitted_at = review_data.get('submitted_at')
-                            
-                            if submitted_at and reviewer == self.username:
-                                review_date = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
-                                if start_date <= review_date <= end_date:
-                                    day_str = review_date.strftime('%Y-%m-%d')
-                                    review_days.add(day_str)
-                                    self.add_activity(day_str, "PR Review", f"on PR #{pr_number}", repo_name)
-                                    
-                        except (json.JSONDecodeError, KeyError):
+                        dt = self._parse_dt(pr['createdAt'])
+                        if not self.in_range(dt):
                             continue
-            
-        except subprocess.CalledProcessError:
-            pass
-        except Exception:
-            pass
-        
-        return review_days
+                        day_str = dt.strftime('%Y-%m-%d')
+                        title = (pr.get('title') or 'Untitled')[:60]
+                        self._add_activity(day_str, "PR Created", f"#{pr_num}: {title}", repo)
+                        all_days.add(day_str)
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
-    def _get_issues_for_repo(self, repo_name: str, start_date: datetime, end_date: datetime) -> Set[str]:
-        """Get issues created by the user in a specific repository."""
-        activity_days = set()
-
-        try:
+            # Issues created
             cmd = [
                 'gh', 'issue', 'list',
-                '--repo', f'{self.org}/{repo_name}',
+                '--repo', f'{self.org}/{repo}',
                 '--author', self.username,
                 '--state', 'all',
                 '--json', 'createdAt,title,number',
-                '--limit', '1000'
+                '--limit', '1000',
             ]
-
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-
+            result = self._run_gh(cmd, category='repo-fallback')
             if result.returncode == 0:
-                issues_data = json.loads(result.stdout) if result.stdout.strip() else []
-
-                for issue in issues_data:
-                    issue_number = issue.get('number')
-                    issue_date = datetime.fromisoformat(issue['createdAt'].replace('Z', '+00:00'))
-                    if issue_date.tzinfo is None:
-                        issue_date = issue_date.replace(tzinfo=timezone.utc)
-                    if start_date <= issue_date <= end_date:
-                        day_str = issue_date.strftime('%Y-%m-%d')
-                        activity_days.add(day_str)
-                        issue_title = issue.get('title', 'Untitled')[:60]
-                        self.add_activity(day_str, "Issue Created", f"#{issue_number}: {issue_title}", repo_name)
-
-        except subprocess.CalledProcessError:
-            pass
-        except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking issues in {repo_name}: {e}")
-
-        return activity_days
-
-    def _get_issue_comments_for_repo(self, repo_name: str, start_date: datetime, end_date: datetime) -> Set[str]:
-        """Get issue comments by the user in a specific repository."""
-        activity_days = set()
-
-        try:
-            cmd = [
-                'gh', 'api', f'repos/{self.org}/{repo_name}/issues/comments?per_page=100',
-                '--paginate',
-                '--jq', '.[] | {created_at: .created_at, user: .user.login, issue_url: .issue_url, id: .id}'
-            ]
-
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
-                    if line and line != 'null':
-                        try:
-                            comment_data = json.loads(line)
-                            if comment_data.get('user') == self.username:
-                                comment_date = datetime.fromisoformat(comment_data['created_at'].replace('Z', '+00:00'))
-                                if start_date <= comment_date <= end_date:
-                                    day_str = comment_date.strftime('%Y-%m-%d')
-                                    activity_days.add(day_str)
-                                    # Extract issue number from URL
-                                    issue_url = comment_data.get('issue_url', '')
-                                    issue_number = issue_url.split('/')[-1] if issue_url else 'unknown'
-                                    self.add_activity(day_str, "Issue Comment", f"on issue #{issue_number}", repo_name)
-                        except (json.JSONDecodeError, KeyError):
+                try:
+                    issues = json.loads(result.stdout) if result.stdout.strip() else []
+                    for issue in issues:
+                        issue_num = issue.get('number')
+                        if not self._dedup('issues', (repo, issue_num, 'opened')):
                             continue
-
-        except subprocess.CalledProcessError:
-            pass
-        except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking issue comments in {repo_name}: {e}")
-
-        return activity_days
-
-    def _get_pr_comments_for_repo(self, repo_name: str, start_date: datetime, end_date: datetime) -> Set[str]:
-        """Get PR comments (both review comments and issue comments on PRs) by the user."""
-        activity_days = set()
-
-        # Get review comments (comments on specific code lines)
-        try:
-            cmd = [
-                'gh', 'api', f'repos/{self.org}/{repo_name}/pulls/comments?per_page=100',
-                '--paginate',
-                '--jq', '.[] | {created_at: .created_at, user: .user.login, pull_request_url: .pull_request_url, id: .id}'
-            ]
-
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
-                    if line and line != 'null':
-                        try:
-                            comment_data = json.loads(line)
-                            if comment_data.get('user') == self.username:
-                                comment_date = datetime.fromisoformat(comment_data['created_at'].replace('Z', '+00:00'))
-                                if start_date <= comment_date <= end_date:
-                                    day_str = comment_date.strftime('%Y-%m-%d')
-                                    activity_days.add(day_str)
-                                    # Extract PR number from URL
-                                    pr_url = comment_data.get('pull_request_url', '')
-                                    pr_number = pr_url.split('/')[-1] if pr_url else 'unknown'
-                                    self.add_activity(day_str, "PR Comment", f"on PR #{pr_number}", repo_name)
-                        except (json.JSONDecodeError, KeyError):
+                        dt = self._parse_dt(issue['createdAt'])
+                        if not self.in_range(dt):
                             continue
+                        day_str = dt.strftime('%Y-%m-%d')
+                        title = (issue.get('title') or 'Untitled')[:60]
+                        self._add_activity(day_str, "Issue Created",
+                                           f"#{issue_num}: {title}", repo)
+                        all_days.add(day_str)
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
-        except subprocess.CalledProcessError:
-            pass
-        except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking PR comments in {repo_name}: {e}")
+            # Comments, wiki, reviews — reuse targeted fallback methods
+            all_days.update(self._fetch_repo_issue_comments(repo))
+            all_days.update(self._fetch_repo_pr_review_comments(repo))
+            all_days.update(self._fetch_repo_commit_comments(repo))
+            all_days.update(self._fetch_repo_wiki_edits(repo))
+            all_days.update(self._fetch_repo_pr_reviews(repo))
 
-        return activity_days
-
-    def _get_commit_comments_for_repo(self, repo_name: str, start_date: datetime, end_date: datetime) -> Set[str]:
-        """Get commit comments by the user in a specific repository."""
-        activity_days = set()
-
-        try:
-            cmd = [
-                'gh', 'api', f'repos/{self.org}/{repo_name}/comments?per_page=100',
-                '--paginate',
-                '--jq', '.[] | {created_at: .created_at, user: .user.login, commit_id: .commit_id, id: .id}'
-            ]
-
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
-                    if line and line != 'null':
-                        try:
-                            comment_data = json.loads(line)
-                            if comment_data.get('user') == self.username:
-                                comment_date = datetime.fromisoformat(comment_data['created_at'].replace('Z', '+00:00'))
-                                if start_date <= comment_date <= end_date:
-                                    day_str = comment_date.strftime('%Y-%m-%d')
-                                    activity_days.add(day_str)
-                                    commit_id = comment_data.get('commit_id', 'unknown')[:7]
-                                    self.add_activity(day_str, "Commit Comment", f"on commit {commit_id}", repo_name)
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-
-        except subprocess.CalledProcessError:
-            pass
-        except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking commit comments in {repo_name}: {e}")
-
-        return activity_days
-
-    def get_user_search_activity(self) -> Set[str]:
-        """Alternative method using GitHub search (may be more comprehensive)."""
-        if not self.check_gh_cli():
-            return set()
-
-        activity_days = set()
-        start_date, end_date = self.get_month_date_range()
-
-        if self.verbose:
-            print(f"Using GitHub search for {self.username} activity in {self.org}")
-        
-        # Search for commits using multiple author variations
-        commit_days = set()
-        
-        try:
-            # Try each username variation
-            for username_var in self.username_variations:
-                search_query = f'org:{self.org} author:"{username_var}" committer-date:{start_date.strftime("%Y-%m-%d")}..{end_date.strftime("%Y-%m-%d")}'
-                encoded_query = quote_plus(search_query)
-                
-                cmd = [
-                    'gh', 'api', f'search/commits?q={encoded_query}',
-                    '--paginate',
-                    '--jq', '.items[] | {date: .commit.author.date, sha: .sha, message: .commit.message, repo: .repository.name, author_name: .commit.author.name, author_email: .commit.author.email}'
-                ]
-                
-                result = self._run_gh_command(cmd, capture_output=True, text=True)
-                
-                if result.returncode == 0:
-                    for line in result.stdout.strip().split('\n'):
-                        if line and line != 'null':
-                            try:
-                                commit_info = json.loads(line)
-                                commit_sha = commit_info.get('sha', '')
-                                author_name = commit_info.get('author_name', '').strip()
-                                author_email = commit_info.get('author_email', '').strip()
-                                
-                                # Skip if we've already seen this commit globally
-                                if commit_sha in self.seen_commits:
-                                    continue
-                                self.seen_commits.add(commit_sha)
-                                
-                                # Verify the author actually matches our user (don't trust search API blindly!)
-                                is_user_commit = (
-                                    author_name in self.username_variations or
-                                    author_email.split('@')[0].lower() == self.username.lower() or
-                                    self.username.lower() in author_name.lower()
-                                )
-                                
-                                if not is_user_commit:
-                                    continue  # Skip commits that don't actually match our user
-                                
-                                commit_date = datetime.fromisoformat(commit_info['date'].replace('Z', '+00:00'))
-                                day_str = commit_date.strftime('%Y-%m-%d')
-                                
-                                # Double-check date range (search seems to have issues)
-                                if start_date <= commit_date <= end_date:
-                                    commit_days.add(day_str)
-                                    # Use short hash for display
-                                    short_sha = commit_sha[:7]
-                                    message = commit_info.get('message', '').split('\n')[0][:60]
-                                    repo_name = commit_info.get('repo', 'unknown')
-                                    self.add_activity(day_str, "Commit", f"{short_sha}: {message}", repo_name)
-                                    
-                            except (json.JSONDecodeError, KeyError):
-                                continue
-            
-            activity_days.update(commit_days)
-            if self.verbose:
-                print(f"Found {len(commit_days)} days with commits via search")
-            
-        except Exception as e:
-            if self.verbose:
-                print(f"Warning: Commit search failed: {e}")
-        
-        # Search for pull requests
-        try:
-            search_query = f"org:{self.org} author:{self.username} created:{start_date.strftime('%Y-%m-%d')}..{end_date.strftime('%Y-%m-%d')} type:pr"
-            encoded_query = quote_plus(search_query)
-            
-            cmd = [
-                'gh', 'api', f'search/issues?q={encoded_query}',
-                '--paginate',
-                '--jq', '.items[] | {created_at: .created_at, title: .title, number: .number, repo: .repository_url}'
-            ]
-            
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                pr_days = set()
-                for line in result.stdout.strip().split('\n'):
-                    if line and line != 'null':
-                        try:
-                            pr_info = json.loads(line)
-                            pr_number = pr_info.get('number')
-                            repo_url = pr_info.get('repo', '')
-                            repo_name = repo_url.split('/')[-1] if repo_url else 'unknown'
-                            pr_key = (repo_name, pr_number)
-                            
-                            # Skip if we've already seen this PR globally
-                            if pr_key in self.seen_prs:
-                                continue
-                            self.seen_prs.add(pr_key)
-                            
-                            pr_date = datetime.fromisoformat(pr_info['created_at'].replace('Z', '+00:00'))
-                            # Double-check date range
-                            if start_date <= pr_date <= end_date:
-                                day_str = pr_date.strftime('%Y-%m-%d')
-                                pr_days.add(day_str)
-                                pr_title = pr_info.get('title', 'Untitled')[:60]
-                                self.add_activity(day_str, "PR Created", f"#{pr_number}: {pr_title}", repo_name)
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-                
-                activity_days.update(pr_days)
-                if self.verbose:
-                    print(f"Found {len(pr_days)} additional days with PRs via search")
-            
-        except Exception as e:
-            if self.verbose:
-                print(f"Warning: PR search failed: {e}")
-
-        # Search for issues created
-        try:
-            search_query = f"org:{self.org} author:{self.username} created:{start_date.strftime('%Y-%m-%d')}..{end_date.strftime('%Y-%m-%d')} type:issue"
-            encoded_query = quote_plus(search_query)
-
-            cmd = [
-                'gh', 'api', f'search/issues?q={encoded_query}',
-                '--paginate',
-                '--jq', '.items[] | {created_at: .created_at, title: .title, number: .number, repo: .repository_url}'
-            ]
-
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-
-            if result.returncode == 0:
-                issue_days = set()
-                for line in result.stdout.strip().split('\n'):
-                    if line and line != 'null':
-                        try:
-                            issue_info = json.loads(line)
-                            issue_number = issue_info.get('number')
-                            repo_url = issue_info.get('repo', '')
-                            repo_name = repo_url.split('/')[-1] if repo_url else 'unknown'
-
-                            issue_date = datetime.fromisoformat(issue_info['created_at'].replace('Z', '+00:00'))
-                            # Double-check date range
-                            if start_date <= issue_date <= end_date:
-                                day_str = issue_date.strftime('%Y-%m-%d')
-                                issue_days.add(day_str)
-                                issue_title = issue_info.get('title', 'Untitled')[:60]
-                                self.add_activity(day_str, "Issue Created", f"#{issue_number}: {issue_title}", repo_name)
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-
-                activity_days.update(issue_days)
-                if self.verbose:
-                    print(f"Found {len(issue_days)} additional days with issues via search")
-
-        except Exception as e:
-            if self.verbose:
-                print(f"Warning: Issue search failed: {e}")
-
-        # Search for issues/PRs where user commented (involves:USERNAME search)
-        try:
-            search_query = f"org:{self.org} involves:{self.username} updated:{start_date.strftime('%Y-%m-%d')}..{end_date.strftime('%Y-%m-%d')}"
-            encoded_query = quote_plus(search_query)
-
-            cmd = [
-                'gh', 'api', f'search/issues?q={encoded_query}',
-                '--paginate',
-                '--jq', '.items[] | {number: .number, repo: .repository_url, updated_at: .updated_at, is_pr: .pull_request}'
-            ]
-
-            result = self._run_gh_command(cmd, capture_output=True, text=True)
-
-            if result.returncode == 0:
-                # For each issue/PR found, check for comments by the user
-                for line in result.stdout.strip().split('\n'):
-                    if line and line != 'null':
-                        try:
-                            item_info = json.loads(line)
-                            item_number = item_info.get('number')
-                            repo_url = item_info.get('repo', '')
-                            repo_name = repo_url.split('/')[-1] if repo_url else 'unknown'
-                            is_pr = item_info.get('is_pr') is not None
-
-                            # Fetch comments for this issue/PR
-                            if is_pr:
-                                # Check PR review comments
-                                pr_comment_days = self._get_pr_comments_for_repo(repo_name, start_date, end_date)
-                                activity_days.update(pr_comment_days)
-                            else:
-                                # Check issue comments
-                                issue_comment_days = self._get_issue_comments_for_repo(repo_name, start_date, end_date)
-                                activity_days.update(issue_comment_days)
-
-                        except (json.JSONDecodeError, KeyError):
-                            continue
-
-                if self.verbose:
-                    print(f"Checked comments for issues/PRs where user was involved")
-
-        except Exception as e:
-            if self.verbose:
-                print(f"Warning: Comment search failed: {e}")
-
-        return activity_days
+        return all_days
 
 
 def main():
-    # Calculate default year/month as last month
     today = datetime.now()
     first_of_this_month = today.replace(day=1)
     last_month = first_of_this_month - timedelta(days=1)
     default_year = last_month.year
     default_month = last_month.month
 
-    parser = argparse.ArgumentParser(description='Extract GitHub activity days using GitHub CLI')
+    parser = argparse.ArgumentParser(
+        description='Extract GitHub activity days using GitHub CLI')
     parser.add_argument('--org', required=True, help='GitHub organization name')
     parser.add_argument('--user', required=True, help='GitHub username')
-    parser.add_argument('--year', type=int, default=default_year, help=f'Year (default: {default_year}, last month)')
-    parser.add_argument('--month', type=int, default=default_month, help=f'Month 1-12 (default: {default_month}, last month)')
-    parser.add_argument('--method', choices=['repos', 'search', 'both'], default='both',
-                        help='Method: repos (check each repo), search (use GitHub search), or both')
+    parser.add_argument('--year', type=int, default=default_year,
+                        help=f'Year (default: {default_year})')
+    parser.add_argument('--month', type=int, default=default_month,
+                        help=f'Month 1-12 (default: {default_month})')
+    parser.add_argument('--strategy',
+                        choices=['auto', 'events-only', 'search-only', 'legacy-repos'],
+                        default='auto',
+                        help='Strategy: auto (default), events-only, search-only, legacy-repos')
     parser.add_argument('--repo-limit', type=int, default=20,
-                        help='Limit number of repositories to check (default: 20, most recent first)')
+                        help='Repo limit for legacy-repos strategy (default: 20)')
     parser.add_argument('--include-repos', type=str, default='',
-                        help='Comma-separated list of repos to always include (e.g., "docs-repo-name,wiki-repo-name")')
-    parser.add_argument('--verbose', action='store_true',
-                        help='Show detailed progress messages during execution')
-    parser.add_argument('--output', help='Output file to save results (JSON format)')
+                        help='Comma-separated repos to always include')
+    parser.add_argument('--verbose', action='store_true', help='Show detailed progress')
+    parser.add_argument('--output', help='Output file (JSON format)')
+
+    # Backward compatibility
+    parser.add_argument('--method', choices=['repos', 'search', 'both'],
+                        help='(Deprecated) Use --strategy instead')
 
     args = parser.parse_args()
 
-    tracker = GitHubCLIActivityTracker(args.org, args.user, args.year, args.month, verbose=args.verbose)
+    # Map deprecated --method to --strategy
+    if args.method:
+        method_map = {'repos': 'legacy-repos', 'search': 'search-only', 'both': 'auto'}
+        args.strategy = method_map[args.method]
+        print(f"Note: --method is deprecated, use --strategy={args.strategy}", file=sys.stderr)
 
-    # Parse include_repos parameter
-    include_repos = [r.strip() for r in args.include_repos.split(',') if r.strip()] if args.include_repos else []
+    tracker = GitHubActivityTracker(args.org, args.user, args.year, args.month,
+                                    verbose=args.verbose)
 
-    all_activity_days = set()
+    if not tracker.check_gh_cli():
+        sys.exit(1)
 
-    if args.method in ['repos', 'both']:
-        if args.verbose:
-            print("=== Method 1: Checking individual repositories ===")
-        repo_days = tracker.get_user_activity(repo_limit=args.repo_limit, include_repos=include_repos)
-        all_activity_days.update(repo_days)
-        if args.verbose:
-            print(f"Repository method found {len(repo_days)} activity days\n")
+    include_repos = ([r.strip() for r in args.include_repos.split(',') if r.strip()]
+                     if args.include_repos else [])
 
-    if args.method in ['search', 'both']:
-        if args.verbose:
-            print("=== Method 2: Using GitHub search ===")
-        search_days = tracker.get_user_search_activity()
-        all_activity_days.update(search_days)
-        if args.verbose:
-            print(f"Search method found {len(search_days)} activity days\n")
-    
-    # Sort and display results
-    sorted_days = sorted(list(all_activity_days))
-    
-    print(f"=== Final Activity Summary ===")
+    if args.strategy == 'auto':
+        all_days = tracker.run_auto(include_repos=include_repos)
+    elif args.strategy == 'events-only':
+        all_days = tracker.run_events_only()
+    elif args.strategy == 'search-only':
+        all_days = tracker.run_search_only(include_repos=include_repos)
+    elif args.strategy == 'legacy-repos':
+        all_days = tracker.run_legacy_repos(repo_limit=args.repo_limit,
+                                            include_repos=include_repos)
+    else:
+        all_days = set()
+
+    # Sort and display
+    sorted_days = sorted(list(all_days))
+
+    print(f"\n=== Activity Summary ===")
     print(f"User: {args.user}")
     print(f"Organization: {args.org}")
     print(f"Period: {args.year}-{args.month:02d}")
+    print(f"Strategy: {args.strategy}")
+    if tracker.events_coverage != 'none':
+        print(f"Events coverage: {tracker.events_coverage}")
     print(f"Total active days: {len(sorted_days)}")
-    print(f"GitHub API calls made: {tracker.api_call_count}")
-    
+
+    # Per-category API call counts
+    total_calls = tracker.api_calls.get('total', 0)
+    print(f"\nAPI calls: {total_calls} total")
+    for cat in sorted(k for k in tracker.api_calls if k != 'total'):
+        print(f"  {cat}: {tracker.api_calls[cat]}")
+
     if sorted_days:
         print(f"\nDetailed daily activity:")
         for day in sorted_days:
@@ -810,7 +1043,7 @@ def main():
                 print(f"    - {activity}")
     else:
         print("\nNo activity found for the specified period.")
-    
+
     # Save to file if requested
     if args.output:
         result = {
@@ -818,16 +1051,21 @@ def main():
             'organization': args.org,
             'year': args.year,
             'month': args.month,
+            'strategy': args.strategy,
+            'events_coverage': tracker.events_coverage,
             'total_active_days': len(sorted_days),
             'active_days': sorted_days,
             'daily_activity_details': dict(tracker.daily_activity),
-            'method_used': args.method,
-            'generated_at': datetime.now().isoformat()
+            'api_calls': {
+                'total': total_calls,
+                **{k: v for k, v in tracker.api_calls.items() if k != 'total'},
+            },
+            'generated_at': datetime.now().isoformat(),
         }
-        
+
         with open(args.output, 'w') as f:
             json.dump(result, f, indent=2)
-        
+
         print(f"\nResults saved to: {args.output}")
 
 
