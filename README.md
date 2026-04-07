@@ -32,8 +32,8 @@ python extract_activity_gh.py --org org-name --user username
 # Specific date
 python extract_activity_gh.py --org org-name --user username --year 2025 --month 12
 
-# Include specific repos (useful for docs repos with active wikis)
-python extract_activity_gh.py --org org-name --user username --include-repos docs-repo,wiki-repo
+# Include specific repos in the fallback scan (e.g. repos with no PR/issue activity)
+python extract_activity_gh.py --org org-name --user username --include-repos some-repo
 
 # Events API only (fastest, limited to last 90 days)
 python extract_activity_gh.py --org org-name --user username --strategy events-only
@@ -61,7 +61,7 @@ python extract_activity_gh.py --org org-name --user username --verbose
 | `--month` | Month to analyze (1-12) | last month |
 | `--strategy` | Strategy pipeline (see below) | `auto` |
 | `--repo-limit` | Repo limit for `legacy-repos` strategy | 20 |
-| `--include-repos` | Comma-separated repos to always include | |
+| `--include-repos` | Comma-separated repos to always include in fallback scan | |
 | `--output` | Output file for JSON results | |
 | `--verbose` | Show detailed progress and invocation stats | |
 | `--method` | **(Deprecated)** Maps to `--strategy` | |
@@ -76,9 +76,9 @@ A three-layer pipeline that balances coverage and efficiency:
 
 2. **Layer 2 — Search supplements**: Org-wide searches for commits, PRs created, PRs merged, and issues created. Also runs an `involves:` search for repo discovery only (not day attribution).
 
-3. **Layer 3 — Targeted per-repo fallback**: Scans only repos discovered in layers 1-2 (plus `--include-repos`) for: issue comments, PR review comments, commit comments, wiki edits, and PR reviews (with accurate `submitted_at` timestamps). Uses `since` server-side filters where available.
+3. **Layer 3 — Targeted per-repo fallback**: Scans repos discovered in layers 1-2 (plus `--include-repos`) for: issue comments, PR review comments, commit comments, and PR reviews (with accurate `submitted_at` timestamps). Uses `since` server-side filters where available.
 
-PR review fallback (the most expensive part) is skipped when Events API coverage is complete.
+4. **Wiki discovery**: Automatically lists org repos with wikis enabled and scans them for wiki edits by the user (wiki-only repos are invisible to layers 1-2).
 
 **Typical gh invocations: 10-30** (vs. 300+ with `legacy-repos`)
 

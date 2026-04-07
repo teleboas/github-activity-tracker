@@ -1177,7 +1177,7 @@ def main():
     parser.add_argument('--repo-limit', type=int, default=20,
                         help='Repo limit for legacy-repos strategy (default: 20)')
     parser.add_argument('--include-repos', type=str, default='',
-                        help='Comma-separated repos to always include')
+                        help='Comma-separated repos to always include in fallback scan')
     parser.add_argument('--verbose', action='store_true', help='Show detailed progress')
     parser.add_argument('--output', help='Output file (JSON format)')
 
