@@ -797,6 +797,28 @@ class GitHubActivityTracker:
 
         return activity_days
 
+    def _discover_wiki_repos(self) -> List[str]:
+        """Find org repos that have wikis enabled.
+
+        Wiki edits (GollumEvents) only appear on the repo's own events
+        endpoint. Repos with only wiki activity are never discovered by
+        the normal pipeline (commits/PRs/issues/search), so we need to
+        proactively find repos with wikis and scan them.
+        """
+        cmd = [
+            'gh', 'repo', 'list', self.org,
+            '--json', 'name,hasWikiEnabled',
+            '--limit', '200',
+        ]
+        result = self._run_gh(cmd, category='repo-fallback')
+        if result.returncode != 0:
+            return []
+        try:
+            repos = json.loads(result.stdout)
+            return [r['name'] for r in repos if r.get('hasWikiEnabled')]
+        except (json.JSONDecodeError, KeyError):
+            return []
+
     def _fetch_repo_wiki_edits(self, repo: str) -> Set[str]:
         """Fetch wiki edits via the repo events endpoint."""
         activity_days = set()
@@ -947,6 +969,19 @@ class GitHubActivityTracker:
             # /pulls/{n}/reviews endpoint is the only reliable source.
             all_days.update(self._fetch_repo_pr_reviews(repo))
 
+        # Scan wiki-enabled repos not already covered
+        wiki_repos = self._discover_wiki_repos()
+        extra_wiki_repos = [r for r in wiki_repos if r not in self.touched_repos]
+        if extra_wiki_repos:
+            if self.verbose:
+                print(f"\n=== Wiki scan: {len(extra_wiki_repos)} additional wiki-enabled repos ===")
+            for repo in sorted(extra_wiki_repos):
+                days = self._fetch_repo_wiki_edits(repo)
+                if days:
+                    all_days.update(days)
+                    if self.verbose:
+                        print(f"  Found wiki edits in {repo}")
+
         return all_days
 
     def run_events_only(self) -> Set[str]:
@@ -984,6 +1019,19 @@ class GitHubActivityTracker:
             all_days.update(self._fetch_repo_commit_comments(repo))
             all_days.update(self._fetch_repo_wiki_edits(repo))
             all_days.update(self._fetch_repo_pr_reviews(repo))
+
+        # Scan wiki-enabled repos not already covered
+        wiki_repos = self._discover_wiki_repos()
+        extra_wiki_repos = [r for r in wiki_repos if r not in self.touched_repos]
+        if extra_wiki_repos:
+            if self.verbose:
+                print(f"\n  Wiki scan: {len(extra_wiki_repos)} additional wiki-enabled repos")
+            for repo in sorted(extra_wiki_repos):
+                days = self._fetch_repo_wiki_edits(repo)
+                if days:
+                    all_days.update(days)
+                    if self.verbose:
+                        print(f"  Found wiki edits in {repo}")
 
         return all_days
 
