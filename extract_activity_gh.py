@@ -916,13 +916,12 @@ class GitHubActivityTracker:
     # Strategy orchestration
     # ═══════════════════════════════════════════════════════════════════
 
-    def run_auto(self, include_repos: List[str] = None) -> Set[str]:
+    def run_auto(self) -> Set[str]:
         """
         Default layered strategy:
         Events API -> Search supplements -> Targeted per-repo fallback.
         """
         all_days = set()
-        include_repos = include_repos or []
 
         # Layer 1: Events API
         if self.verbose:
@@ -940,10 +939,6 @@ class GitHubActivityTracker:
         # Discover repos via involves: search
         involved_repos = self._search_involved_repos()
         self.touched_repos.update(involved_repos)
-
-        # Add explicitly included repos
-        for repo in include_repos:
-            self.touched_repos.add(repo)
 
         # Layer 3: Targeted per-repo fallback
         if self.verbose:
@@ -990,10 +985,9 @@ class GitHubActivityTracker:
             print("=== Strategy: events-only ===")
         return self._fetch_events()
 
-    def run_search_only(self, include_repos: List[str] = None) -> Set[str]:
+    def run_search_only(self) -> Set[str]:
         """Search API + targeted fallback (no events). Works for any date range."""
         all_days = set()
-        include_repos = include_repos or []
 
         if self.verbose:
             print("=== Strategy: search-only ===")
@@ -1005,8 +999,6 @@ class GitHubActivityTracker:
 
         involved_repos = self._search_involved_repos()
         self.touched_repos.update(involved_repos)
-        for repo in include_repos:
-            self.touched_repos.add(repo)
 
         if self.verbose:
             print(f"\n  Targeted fallback for {len(self.touched_repos)} repos")
@@ -1035,126 +1027,6 @@ class GitHubActivityTracker:
 
         return all_days
 
-    def run_legacy_repos(self, repo_limit: int = 20, include_repos: List[str] = None) -> Set[str]:
-        """
-        Legacy per-repo crawl (backward compat / debug).
-        Still uses corrected date handling and server-side filters.
-        """
-        all_days = set()
-        include_repos = include_repos or []
-
-        if self.verbose:
-            print("=== Strategy: legacy-repos ===")
-
-        cmd = ['gh', 'repo', 'list', self.org, '--json', 'name', '--limit', str(repo_limit)]
-        result = self._run_gh(cmd, category='repo-fallback')
-
-        repos = []
-        if result.returncode == 0:
-            try:
-                repos = [r['name'] for r in json.loads(result.stdout)]
-            except (json.JSONDecodeError, KeyError):
-                pass
-
-        for repo in include_repos:
-            if repo not in repos:
-                repos.append(repo)
-
-        if self.verbose:
-            print(f"  Scanning {len(repos)} repositories")
-
-        for repo in repos:
-            if self.verbose:
-                print(f"  Scanning {repo}...")
-
-            # Commits with server-side author + since + until
-            cmd = [
-                'gh', 'api',
-                f'repos/{self.org}/{repo}/commits?author={self.username}'
-                f'&since={self._since_iso()}&until={self._until_iso()}&per_page=100',
-                '--paginate',
-                '--jq', '.[] | {sha: .sha, date: .commit.author.date, '
-                        'message: .commit.message}',
-            ]
-            result = self._run_gh(cmd, category='repo-fallback')
-            if result.returncode == 0:
-                for data in self._parse_lines(result.stdout):
-                    sha = data.get('sha', '')
-                    if not self._dedup('commits', sha):
-                        continue
-                    dt = self._parse_dt(data['date'])
-                    if not self.in_range(dt):
-                        continue
-                    day_str = dt.strftime('%Y-%m-%d')
-                    msg = data.get('message', '').split('\n')[0][:60]
-                    self._add_activity(day_str, "Commit", f"{sha[:7]}: {msg}", repo)
-                    all_days.add(day_str)
-
-            # PRs created
-            cmd = [
-                'gh', 'pr', 'list',
-                '--repo', f'{self.org}/{repo}',
-                '--author', self.username,
-                '--state', 'all',
-                '--json', 'createdAt,title,number',
-                '--limit', '1000',
-            ]
-            result = self._run_gh(cmd, category='repo-fallback')
-            if result.returncode == 0:
-                try:
-                    prs = json.loads(result.stdout) if result.stdout.strip() else []
-                    for pr in prs:
-                        pr_num = pr.get('number')
-                        if not self._dedup('prs', (repo, pr_num, 'created')):
-                            continue
-                        dt = self._parse_dt(pr['createdAt'])
-                        if not self.in_range(dt):
-                            continue
-                        day_str = dt.strftime('%Y-%m-%d')
-                        title = (pr.get('title') or 'Untitled')[:60]
-                        self._add_activity(day_str, "PR Created", f"#{pr_num}: {title}", repo)
-                        all_days.add(day_str)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-
-            # Issues created
-            cmd = [
-                'gh', 'issue', 'list',
-                '--repo', f'{self.org}/{repo}',
-                '--author', self.username,
-                '--state', 'all',
-                '--json', 'createdAt,title,number',
-                '--limit', '1000',
-            ]
-            result = self._run_gh(cmd, category='repo-fallback')
-            if result.returncode == 0:
-                try:
-                    issues = json.loads(result.stdout) if result.stdout.strip() else []
-                    for issue in issues:
-                        issue_num = issue.get('number')
-                        if not self._dedup('issues', (repo, issue_num, 'opened')):
-                            continue
-                        dt = self._parse_dt(issue['createdAt'])
-                        if not self.in_range(dt):
-                            continue
-                        day_str = dt.strftime('%Y-%m-%d')
-                        title = (issue.get('title') or 'Untitled')[:60]
-                        self._add_activity(day_str, "Issue Created",
-                                           f"#{issue_num}: {title}", repo)
-                        all_days.add(day_str)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-
-            # Comments, wiki, reviews — reuse targeted fallback methods
-            all_days.update(self._fetch_repo_issue_comments(repo))
-            all_days.update(self._fetch_repo_pr_review_comments(repo))
-            all_days.update(self._fetch_repo_commit_comments(repo))
-            all_days.update(self._fetch_repo_wiki_edits(repo))
-            all_days.update(self._fetch_repo_pr_reviews(repo))
-
-        return all_days
-
-
 def main():
     today = datetime.now()
     first_of_this_month = today.replace(day=1)
@@ -1171,13 +1043,9 @@ def main():
     parser.add_argument('--month', type=int, default=default_month,
                         help=f'Month 1-12 (default: {default_month})')
     parser.add_argument('--strategy',
-                        choices=['auto', 'events-only', 'search-only', 'legacy-repos'],
+                        choices=['auto', 'events-only', 'search-only'],
                         default='auto',
-                        help='Strategy: auto (default), events-only, search-only, legacy-repos')
-    parser.add_argument('--repo-limit', type=int, default=20,
-                        help='Repo limit for legacy-repos strategy (default: 20)')
-    parser.add_argument('--include-repos', type=str, default='',
-                        help='Comma-separated repos to always include in fallback scan')
+                        help='Strategy: auto (default), events-only, search-only')
     parser.add_argument('--verbose', action='store_true', help='Show detailed progress')
     parser.add_argument('--output', help='Output file (JSON format)')
 
@@ -1189,7 +1057,7 @@ def main():
 
     # Map deprecated --method to --strategy
     if args.method:
-        method_map = {'repos': 'legacy-repos', 'search': 'search-only', 'both': 'auto'}
+        method_map = {'repos': 'auto', 'search': 'search-only', 'both': 'auto'}
         args.strategy = method_map[args.method]
         print(f"Note: --method is deprecated, use --strategy={args.strategy}", file=sys.stderr)
 
@@ -1202,21 +1070,15 @@ def main():
     if not tracker.validate_user():
         sys.exit(1)
 
-    include_repos = ([r.strip() for r in args.include_repos.split(',') if r.strip()]
-                     if args.include_repos else [])
-
     # Snapshot rate limit before run to compute true HTTP request count
     tracker.rate_limit_before = tracker.snapshot_rate_limit()
 
     if args.strategy == 'auto':
-        all_days = tracker.run_auto(include_repos=include_repos)
+        all_days = tracker.run_auto()
     elif args.strategy == 'events-only':
         all_days = tracker.run_events_only()
     elif args.strategy == 'search-only':
-        all_days = tracker.run_search_only(include_repos=include_repos)
-    elif args.strategy == 'legacy-repos':
-        all_days = tracker.run_legacy_repos(repo_limit=args.repo_limit,
-                                            include_repos=include_repos)
+        all_days = tracker.run_search_only()
     else:
         all_days = set()
 
