@@ -166,6 +166,16 @@ class GitHubActivityTracker:
             print("Error: GitHub CLI (gh) not found. Install: https://cli.github.com/")
             return False
 
+    def validate_user(self) -> bool:
+        """Verify that the GitHub user exists."""
+        result = subprocess.run(
+            ['gh', 'api', f'users/{self.username}', '--jq', '.login'],
+            capture_output=True, text=True)
+        if result.returncode != 0 or not result.stdout.strip():
+            print(f"Error: GitHub user '{self.username}' not found.", file=sys.stderr)
+            return False
+        return True
+
     def snapshot_rate_limit(self) -> Optional[int]:
         """Query GitHub's rate_limit API and return the 'used' count."""
         try:
@@ -463,7 +473,12 @@ class GitHubActivityTracker:
     # ═══════════════════════════════════════════════════════════════════
 
     def _search_commits(self) -> Set[str]:
-        """Search for commits by this user in the org."""
+        """Search for commits by this user in the org.
+
+        Note: GitHub's commit search `author:` qualifier does fuzzy matching
+        on the git author name, not just the GitHub login. We post-filter
+        results by .author.login to avoid false positives.
+        """
         activity_days = set()
         query = (f'org:{self.org} author:{self.username} '
                  f'committer-date:{self._start_str()}..{self._search_end_date_str()}')
@@ -472,7 +487,8 @@ class GitHubActivityTracker:
             'gh', 'api', f'search/commits?q={quote_plus(query)}&per_page=100',
             '--paginate',
             '--jq', '.items[] | {sha: .sha, date: .commit.author.date, '
-                    'message: .commit.message, repo: .repository.name}',
+                    'message: .commit.message, repo: .repository.name, '
+                    'author_login: .author.login}',
         ]
 
         result = self._run_gh(cmd, category='search')
@@ -482,6 +498,10 @@ class GitHubActivityTracker:
             return activity_days
 
         for data in self._parse_lines(result.stdout):
+            # Post-filter: verify the GitHub login matches exactly
+            author_login = data.get('author_login', '')
+            if author_login and author_login.lower() != self.username.lower():
+                continue
             sha = data.get('sha', '')
             if not self._dedup('commits', sha):
                 continue
@@ -1129,6 +1149,9 @@ def main():
                                     verbose=args.verbose)
 
     if not tracker.check_gh_cli():
+        sys.exit(1)
+
+    if not tracker.validate_user():
         sys.exit(1)
 
     include_repos = ([r.strip() for r in args.include_repos.split(',') if r.strip()]
