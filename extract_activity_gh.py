@@ -44,8 +44,12 @@ class GitHubActivityTracker:
             'releases': set(),    # (repo, tag_name)
         }
 
-        # Per-category API call tracking
+        # Per-category gh invocation tracking
         self.api_calls: Dict[str, int] = defaultdict(int)
+
+        # Rate limit snapshots for true HTTP request counting
+        self.rate_limit_before: Optional[int] = None
+        self.rate_limit_after: Optional[int] = None
 
         # Repos discovered as touched by the user (populated during execution)
         self.touched_repos: Set[str] = set()
@@ -136,6 +140,24 @@ class GitHubActivityTracker:
         except FileNotFoundError:
             print("Error: GitHub CLI (gh) not found. Install: https://cli.github.com/")
             return False
+
+    def snapshot_rate_limit(self) -> Optional[int]:
+        """Query GitHub's rate_limit API and return the 'used' count."""
+        try:
+            result = subprocess.run(
+                ['gh', 'api', 'rate_limit', '--jq', '.rate.used'],
+                capture_output=True, text=True)
+            if result.returncode == 0:
+                return int(result.stdout.strip())
+        except (ValueError, FileNotFoundError):
+            pass
+        return None
+
+    def get_http_request_count(self) -> Optional[int]:
+        """Return the number of HTTP requests consumed, or None if unavailable."""
+        if self.rate_limit_before is not None and self.rate_limit_after is not None:
+            return self.rate_limit_after - self.rate_limit_before
+        return None
 
     # ═══════════════════════════════════════════════════════════════════
     # Layer 1: Events API
@@ -1029,6 +1051,9 @@ def main():
     include_repos = ([r.strip() for r in args.include_repos.split(',') if r.strip()]
                      if args.include_repos else [])
 
+    # Snapshot rate limit before run to compute true HTTP request count
+    tracker.rate_limit_before = tracker.snapshot_rate_limit()
+
     if args.strategy == 'auto':
         all_days = tracker.run_auto(include_repos=include_repos)
     elif args.strategy == 'events-only':
@@ -1040,6 +1065,9 @@ def main():
                                             include_repos=include_repos)
     else:
         all_days = set()
+
+    # Snapshot rate limit after run
+    tracker.rate_limit_after = tracker.snapshot_rate_limit()
 
     # Sort and display
     sorted_days = sorted(list(all_days))
@@ -1053,9 +1081,13 @@ def main():
         print(f"Events coverage: {tracker.events_coverage}")
     print(f"Total active days: {len(sorted_days)}")
 
-    # Per-category gh invocation counts (paginated commands count as one)
-    total_calls = tracker.api_calls.get('total', 0)
-    print(f"\ngh invocations: {total_calls} total")
+    # API usage stats
+    total_invocations = tracker.api_calls.get('total', 0)
+    http_requests = tracker.get_http_request_count()
+    if http_requests is not None:
+        print(f"\nGitHub API requests: {http_requests} (across {total_invocations} gh invocations)")
+    else:
+        print(f"\ngh invocations: {total_invocations} total")
     for cat in sorted(k for k in tracker.api_calls if k != 'total'):
         print(f"  {cat}: {tracker.api_calls[cat]}")
 
@@ -1081,9 +1113,10 @@ def main():
             'total_active_days': len(sorted_days),
             'active_days': sorted_days,
             'daily_activity_details': dict(tracker.daily_activity),
-            'api_calls': {
-                'total': total_calls,
-                **{k: v for k, v in tracker.api_calls.items() if k != 'total'},
+            'api_usage': {
+                'http_requests': http_requests,
+                'gh_invocations': total_invocations,
+                'by_category': {k: v for k, v in tracker.api_calls.items() if k != 'total'},
             },
             'generated_at': datetime.now().isoformat(),
         }

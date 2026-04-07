@@ -146,7 +146,7 @@ Strategy: auto
 Events coverage: complete
 Total active days: 12
 
-gh invocations: 18 total
+GitHub API requests: 24 (across 18 gh invocations)
   events: 1
   repo-fallback: 12
   search: 5
