@@ -121,6 +121,7 @@ Backward-compatible per-repo crawl. Scans the N most recently updated repos in t
 
 - **Events API**: Limited to ~300 events and ~90 days of history. For very active users, events may be truncated mid-month. The tool detects this and marks coverage as `partial`, triggering search supplements.
 - **Search API**: Cannot find commit comments, wiki edits, or PR reviews. Cannot determine the exact day a PR was reviewed (only the PR's created/updated date). These gaps are filled by the targeted per-repo fallback.
+- **Commit author identity edge case**: Commit search is post-filtered by exact GitHub login (`.author.login`) to avoid fuzzy `author:` false positives. This can skip very old commits whose `author` mapping is missing (`author = null`). Also, invalid `--user` values now fail fast via `/users/{username}` validation instead of returning fuzzy commit matches.
 - **PR merges by non-authors**: The `merged:` search qualifier finds PRs authored by the user. Merging someone else's PR is only captured via the Events API (PullRequestEvent where the actor is the merger).
 - **Issue triage**: Closing, reopening, and labeling issues is only captured via Events API (IssuesEvent).
 - **Wiki edits**: Only available through Events API or repo events endpoint (~90 days retention). For months older than 90 days, wiki edits are silently missed regardless of strategy.
