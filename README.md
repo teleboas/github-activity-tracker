@@ -4,13 +4,13 @@ A Python tool to extract activity days for a specific GitHub user within an orga
 
 ## Features
 
-- **Dual Search Strategy**: Combines repository-by-repository checking with GitHub search API for comprehensive coverage
-- **Comprehensive Activity Detection**: Tracks commits, pull requests, issues, comments, PR reviews, and wiki edits
+- **Layered Strategy**: Events API -> Search API -> Targeted per-repo fallback for optimal coverage with minimal gh invocations
+- **Comprehensive Activity Detection**: Tracks commits, pull requests (created/merged/closed), issues (created/closed/reopened), comments, PR reviews, wiki edits, releases, branch/tag creation, and forks
+- **Efficient API Usage**: Typically 10-30 gh invocations
+- **Coverage Guardrails**: Detects Events API truncation and automatically supplements with search/fallback
 - **Flexible Date Ranges**: Specify any year and month
 - **JSON Output**: Save results in structured format with detailed daily activity breakdown
-- **Rate Limit Friendly**: Handles GitHub API pagination and limits
-- **Wiki Support**: Tracks wiki edits via GitHub Events API
-- **Deduplication**: Automatically deduplicates activity found by both search methods
+- **Deduplication**: Unified dedup registry across all data sources by stable IDs
 
 ## Installation
 
@@ -25,41 +25,95 @@ gh auth login
 
 ## Usage
 
-The script uses GitHub CLI for authentication and API access:
-
 ```bash
-# Basic usage (checks last month by default)
+# Basic usage (checks last month by default, uses 'auto' strategy)
 python extract_activity_gh.py --org org-name --user username
 
-# Use only repository-by-repository method
-python extract_activity_gh.py --org org-name --user username --method repos
+# Specific date
+python extract_activity_gh.py --org org-name --user username --year 2025 --month 12
 
-# Use only GitHub search (faster, may miss some activity)
-python extract_activity_gh.py --org org-name --user username --method search
+# Events API only (fastest, limited to last 90 days)
+python extract_activity_gh.py --org org-name --user username --strategy events-only
 
-# Specific user/org/date
-python extract_activity_gh.py --org org-name --user username --year 2024 --month 12
-
-# Include specific repos (useful for docs repos with active wikis)
-python extract_activity_gh.py --org org-name --user username --include-repos docs-repo-name,wiki-repo-name
-
-# Limit repo checks but include specific repos
-python extract_activity_gh.py --org org-name --user username --repo-limit 10 --include-repos docs-repo-name
+# Search only (works for any date range, no 90-day limit)
+python extract_activity_gh.py --org org-name --user username --strategy search-only
 
 # Save results to JSON
 python extract_activity_gh.py --org org-name --user username --output activity_report.json
+
+# Verbose mode shows per-layer progress and invocation breakdown
+python extract_activity_gh.py --org org-name --user username --verbose
 ```
 
 ### Command Line Arguments
-- `--org`: GitHub organization name (**required**)
-- `--user`: GitHub username (**required**)
-- `--year`: Year to analyze (default: last month's year)
-- `--month`: Month to analyze (default: last month)
-- `--method`: Method to use - 'repos', 'search', or 'both' (default: both)
-- `--repo-limit`: Number of most recent repos to check (default: 20)
-- `--include-repos`: Comma-separated list of repos to always include (e.g., "docs-repo-name,wiki-repo-name")
-- `--output`: Output file for JSON results
-- `--verbose`: Enable verbose output with API call tracking
+
+| Argument | Description | Default |
+|---|---|---|
+| `--org` | GitHub organization name | **required** |
+| `--user` | GitHub username | **required** |
+| `--year` | Year to analyze | last month's year |
+| `--month` | Month to analyze (1-12) | last month |
+| `--strategy` | Strategy pipeline (see below) | `auto` |
+| `--output` | Output file for JSON results | |
+| `--verbose` | Show detailed progress and invocation stats | |
+| `--method` | **(Deprecated)** Maps to `--strategy` | |
+
+## Strategies
+
+### `auto` (default, recommended)
+
+A three-layer pipeline that balances coverage and efficiency:
+
+1. **Layer 1 — Events API** (`/users/{user}/events/orgs/{org}`): Primary source for months within 90 days of today. Parses all event types with accurate timestamps. Detects truncation (API cap of ~300 events or history not reaching month start).
+
+2. **Layer 2 — Search supplements**: Org-wide searches for commits, PRs created, PRs merged, and issues created. Also runs an `involves:` search for repo discovery only (not day attribution).
+
+3. **Layer 3 — Targeted per-repo fallback**: Scans repos discovered in layers 1-2 for: issue comments, PR review comments, commit comments, and PR reviews (with accurate `submitted_at` timestamps). Uses `since` server-side filters where available.
+
+4. **Wiki discovery**: Automatically lists org repos with wikis enabled and scans them for wiki edits by the user (wiki-only repos are invisible to layers 1-2).
+
+**Typical gh invocations: 10-30**
+
+### `events-only`
+
+Events API only. Fastest option but limited to the last 90 days and ~300 events. Good for quick checks on recent months for users with moderate activity.
+
+### `search-only`
+
+Search API + targeted per-repo fallback. Works for any date range (no 90-day limit on search queries). Slightly more gh invocations than `auto` for recent months since it can't skip the PR review fallback.
+
+**Caveat**: Wiki edits and some event types (create/delete/release/fork) are only available through the Events API or the repo events endpoint, which is limited to ~90 days of history. For months older than 90 days, these activity types may be silently missed.
+
+## Activity Types Tracked
+
+| Type | Events API | Search API | Per-repo fallback |
+|---|---|---|---|
+| Commits | PushEvent | search/commits | commits endpoint |
+| PR Created | PullRequestEvent (opened) | search/issues type:pr | pr list |
+| PR Merged | PullRequestEvent (closed+merged) | search/issues is:merged | - |
+| PR Closed/Reopened | PullRequestEvent | - | - |
+| PR Review | PullRequestReviewEvent | - | pulls/{n}/reviews |
+| Issue Created | IssuesEvent (opened) | search/issues type:issue | issue list |
+| Issue Closed/Reopened | IssuesEvent | - | - |
+| Issue Comment | IssueCommentEvent | - | issues/comments |
+| PR Comment | IssueCommentEvent (on PR) | - | issues/comments |
+| PR Review Comment | PullRequestReviewCommentEvent | - | pulls/comments |
+| Commit Comment | CommitCommentEvent | - | comments endpoint |
+| Wiki Edit | GollumEvent | - | repo events |
+| Branch/Tag Created | CreateEvent | - | - |
+| Branch/Tag Deleted | DeleteEvent | - | - |
+| Release | ReleaseEvent | - | - |
+| Fork | ForkEvent | - | - |
+
+## Coverage Notes and Limitations
+
+- **Events API**: Limited to ~300 events and ~90 days of history. For very active users, events may be truncated mid-month. The tool detects this and marks coverage as `partial`, triggering search supplements.
+- **Search API**: Cannot find commit comments, wiki edits, or PR reviews. Cannot determine the exact day a PR was reviewed (only the PR's created/updated date). These gaps are filled by the targeted per-repo fallback.
+- **Commit author identity edge case**: Commit search is post-filtered by exact GitHub login (`.author.login`) to avoid fuzzy `author:` false positives. This can skip very old commits whose `author` mapping is missing (`author = null`). Also, invalid `--user` values now fail fast via `/users/{username}` validation instead of returning fuzzy commit matches.
+- **PR merges by non-authors**: The `merged:` search qualifier finds PRs authored by the user. Merging someone else's PR is only captured via the Events API (PullRequestEvent where the actor is the merger).
+- **Issue triage**: Closing, reopening, and labeling issues is only captured via Events API (IssuesEvent).
+- **Wiki edits**: Only available through Events API or repo events endpoint (~90 days retention). For months older than 90 days, wiki edits are silently missed regardless of strategy.
+- **GitHub Discussions**: Not currently tracked by any layer.
 
 ## Authentication
 
@@ -71,71 +125,28 @@ The tool uses GitHub CLI for authentication. Make sure you have:
 
 ## Output
 
-The tool outputs:
-- List of active days in YYYY-MM-DD format
-- Total count of active days
-- Detailed breakdown of activity by day
-- Summary information
-
 Example output:
 ```
-=== Final Activity Summary ===
+=== Activity Summary ===
 User: username
 Organization: org-name
-Period: 2025-08
+Period: 2026-03
+Strategy: auto
+Events coverage: complete
 Total active days: 12
-GitHub API calls made: 45
+
+GitHub API requests: 24 (across 18 gh invocations)
+  events: 1
+  repo-fallback: 12
+  search: 5
 
 Detailed daily activity:
-  2025-08-01:
+  2026-03-01:
     - Commit: abc1234: Fix bug in authentication in repo-name
     - PR Created: #123: Add new feature in repo-name
-  2025-08-03:
-    - PR Review: on PR #124 in repo-name
+  2026-03-03:
+    - PR Review: on PR #124 (APPROVED) in repo-name
     - Issue Comment: on issue #125 in repo-name
-    - Wiki Edit: edited 'API Documentation' in docs-repo-name
-  2025-08-07:
-    - PR Comment: on PR #126 in repo-name
-    - Commit: def5678: Update dependencies in repo-name
+    - Release: published v1.2.0 in repo-name
   ...
 ```
-
-Activity types tracked:
-- **Commits**: Code commits to repositories
-- **PR Created**: Pull requests opened
-- **PR Review**: Formal pull request reviews
-- **PR Comment**: Comments on pull requests
-- **Issue Created**: New issues opened
-- **Issue Comment**: Comments on issues
-- **Commit Comment**: Comments on specific commits
-- **Wiki Edit**: Edits to repository wikis
-
-## How It Works
-
-The tool uses two complementary methods to ensure comprehensive activity tracking:
-
-1. **Repository Method** (`--method repos`):
-   - Fetches the most recently updated repositories in the organization
-   - Checks each repository individually for all activity types
-   - More thorough but makes more API calls
-   - Use `--repo-limit` to control how many repos to check (default: 20)
-   - Use `--include-repos` to ensure specific repos are always checked (useful for docs repos with wikis)
-
-2. **Search Method** (`--method search`):
-   - Uses GitHub's search API to find commits, PRs, and issues
-   - Faster with fewer API calls
-   - May miss some activity types (like wiki edits or some comments)
-   - Good for quick checks across many repositories
-
-3. **Both Methods** (`--method both`, default):
-   - Runs both methods and combines results
-   - Automatically deduplicates activity
-   - Recommended for accurate, comprehensive tracking
-
-## Notes
-
-- The tool automatically handles API pagination
-- Tracks comprehensive activity: commits, PRs, issues, comments, reviews, and wiki edits
-- Activity is automatically deduplicated when using both methods
-- Use `--verbose` flag to see detailed progress and API call statistics
-- The `--include-repos` parameter ensures important repositories (like documentation repos with active wikis) are always checked, regardless of `--repo-limit`
