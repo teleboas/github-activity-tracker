@@ -19,15 +19,22 @@ from collections import defaultdict
 class GitHubActivityTracker:
     """Track GitHub activity for a user in an organization."""
 
-    def __init__(self, org: str, username: str, year: int, month: int, verbose: bool = False):
+    def __init__(self, org: str, username: str, year: int, month: int, verbose: bool = False,
+                 start_date: datetime = None, end_date: datetime = None,
+                 authenticated_user: str = None):
         self.org = org
         self.username = username
         self.year = year
         self.month = month
         self.verbose = verbose
+        self.authenticated_user = authenticated_user
 
         # Date range: [start_date, end_date) — half-open interval
-        self.start_date, self.end_date = self._compute_date_range()
+        if start_date is not None and end_date is not None:
+            self.start_date = start_date
+            self.end_date = end_date
+        else:
+            self.start_date, self.end_date = self._compute_date_range()
 
         # Detailed daily activity
         self.daily_activity: Dict[str, List[str]] = defaultdict(list)
@@ -59,6 +66,9 @@ class GitHubActivityTracker:
 
         # Events coverage assessment
         self.events_coverage: str = 'none'  # none, partial, complete
+
+        # Current actor — set per-event in org-wide mode, None in single-user mode
+        self._current_actor: Optional[str] = None
 
     def _compute_date_range(self) -> Tuple[datetime, datetime]:
         """Compute [start, end) half-open interval for the target month."""
@@ -125,7 +135,8 @@ class GitHubActivityTracker:
     def _add_activity(self, date_str: str, activity_type: str, details: str, repo: str = None):
         """Record an activity entry for a specific date."""
         repo_str = f" in {repo}" if repo else ""
-        entry = f"{activity_type}: {details}{repo_str}"
+        actor_prefix = f"[{self._current_actor}] " if self._current_actor else ""
+        entry = f"{actor_prefix}{activity_type}: {details}{repo_str}"
         if entry not in self.daily_activity[date_str]:
             self.daily_activity[date_str].append(entry)
 
@@ -134,7 +145,7 @@ class GitHubActivityTracker:
         return full_repo.split('/')[-1] if '/' in full_repo else full_repo
 
     def _search_end_date_str(self) -> str:
-        """Last day of the target month as YYYY-MM-DD (for search qualifiers)."""
+        """Last day of the target period as YYYY-MM-DD (for search qualifiers)."""
         return (self.end_date - timedelta(days=1)).strftime('%Y-%m-%d')
 
     def _start_str(self) -> str:
@@ -165,6 +176,19 @@ class GitHubActivityTracker:
         except FileNotFoundError:
             print("Error: GitHub CLI (gh) not found. Install: https://cli.github.com/")
             return False
+
+    @staticmethod
+    def get_authenticated_user() -> Optional[str]:
+        """Return the login of the currently authenticated GitHub user."""
+        try:
+            result = subprocess.run(
+                ['gh', 'api', 'user', '--jq', '.login'],
+                capture_output=True, text=True)
+            if result.returncode == 0:
+                return result.stdout.strip() or None
+        except FileNotFoundError:
+            pass
+        return None
 
     def validate_user(self) -> bool:
         """Verify that the GitHub user exists."""
@@ -203,7 +227,15 @@ class GitHubActivityTracker:
         Primary source: GET /users/{user}/events/orgs/{org}.
         Returns activity days found. Populates self.touched_repos.
         Only useful for months within ~90 days of today.
+        Only works for the authenticated user (404 for others).
         """
+        if (self.authenticated_user
+                and self.username.lower() != self.authenticated_user.lower()):
+            if self.verbose:
+                print("  Events API: skipped (only available for authenticated user)")
+            self.events_coverage = 'none'
+            return set()
+
         now = datetime.now(timezone.utc)
         if (now - self.end_date).days > 90:
             if self.verbose:
@@ -238,6 +270,12 @@ class GitHubActivityTracker:
         for event in self._parse_lines(result.stdout):
             event_id = event.get('id')
             if not event_id or not self._dedup('events', event_id):
+                continue
+
+            # Skip events by other actors (e.g. bots) — the API
+            # occasionally includes them for app-installed integrations.
+            actor = event.get('actor', {}).get('login', '')
+            if actor.lower() != self.username.lower():
                 continue
 
             event_type = event.get('type', '')
@@ -287,6 +325,70 @@ class GitHubActivityTracker:
 
         return activity_days
 
+    def _fetch_org_events(self) -> Set[str]:
+        """
+        Org-wide events: GET /orgs/{org}/events.
+        Like _fetch_events but not scoped to a user. Sets _current_actor
+        per event so _add_activity records who did what.
+        """
+        now = datetime.now(timezone.utc)
+        if (now - self.end_date).days > 90:
+            if self.verbose:
+                print("  Target period is >90 days old, skipping Events API")
+            self.events_coverage = 'none'
+            return set()
+
+        activity_days = set()
+        event_count = 0
+
+        cmd = [
+            'gh', 'api',
+            f'/orgs/{self.org}/events?per_page=100',
+            '--paginate',
+            '--jq', '.[]',
+        ]
+
+        result = self._run_gh(cmd, category='events')
+
+        if result.returncode != 0:
+            if self.verbose:
+                print(f"  Org events API failed: {result.stderr[:200]}")
+            self.events_coverage = 'none'
+            return set()
+
+        for event in self._parse_lines(result.stdout):
+            event_id = event.get('id')
+            if not event_id or not self._dedup('events', event_id):
+                continue
+
+            event_type = event.get('type', '')
+            created_at_str = event.get('created_at', '')
+            if not created_at_str:
+                continue
+            created_at = self._parse_dt(created_at_str)
+            repo = self._repo_short(event.get('repo', {}).get('name', ''))
+            payload = event.get('payload', {})
+            actor = event.get('actor', {}).get('login', '')
+
+            event_count += 1
+
+            if not self.in_range(created_at):
+                continue
+
+            self.touched_repos.add(repo)
+            day_str = created_at.strftime('%Y-%m-%d')
+
+            self._current_actor = actor
+            self._dispatch_event(event_type, payload, day_str, repo, activity_days)
+
+        self._current_actor = None
+        self.events_coverage = 'complete' if event_count > 0 else 'none'
+
+        if self.verbose:
+            print(f"  Org events API: {event_count} events, {len(activity_days)} active days")
+
+        return activity_days
+
     def _dispatch_event(self, event_type: str, payload: dict, day_str: str, repo: str,
                         activity_days: Set[str]):
         """Route an event to the appropriate handler."""
@@ -312,20 +414,36 @@ class GitHubActivityTracker:
 
     def _handle_push_event(self, payload, day_str, repo, activity_days, _type=None):
         for c in payload.get('commits', []):
+            # PushEvent includes all commits in the push. Skip bot commits
+            # to avoid attributing e.g. renovate[bot] commits to the pusher.
+            author_name = c.get('author', {}).get('name', '')
+            if '[bot]' in author_name:
+                continue
             sha = c.get('sha', '')
             if self._dedup('commits', sha):
                 msg = c.get('message', '').split('\n')[0][:60]
                 self._add_activity(day_str, "Commit", f"{sha[:7]}: {msg}", repo)
                 activity_days.add(day_str)
 
+    # PR/issue event actions that are low-signal noise (label changes etc.)
+    _SKIP_PR_ACTIONS = {'labeled', 'unlabeled', 'assigned', 'unassigned',
+                        'review_requested', 'review_request_removed',
+                        'auto_merge_enabled', 'auto_merge_disabled'}
+    _SKIP_ISSUE_ACTIONS = {'labeled', 'unlabeled', 'assigned', 'unassigned',
+                           'milestoned', 'demilestoned'}
+
     def _handle_pr_event(self, payload, day_str, repo, activity_days, _type=None):
         action = payload.get('action', '')
         pr = payload.get('pull_request', {})
         pr_num = pr.get('number')
-        pr_title = (pr.get('title') or 'Untitled')[:60]
+        pr_title = (pr.get('title') or '')[:60]
         if not pr_num:
             return
-        self._cache_title(repo, pr_num, pr_title)
+        if pr_title:
+            self._cache_title(repo, pr_num, pr_title)
+
+        if action in self._SKIP_PR_ACTIONS:
+            return
 
         if action == 'opened':
             dedup_action = 'created'
@@ -343,6 +461,8 @@ class GitHubActivityTracker:
             dedup_action = action
             label = f"PR {action.title()}"
 
+        if not pr_title:
+            pr_title = self._get_title(repo, pr_num) or 'Untitled'
         if self._dedup('prs', (repo, pr_num, dedup_action)):
             self._add_activity(day_str, label, f"#{pr_num}: {pr_title}", repo)
             activity_days.add(day_str)
@@ -365,18 +485,26 @@ class GitHubActivityTracker:
         action = payload.get('action', '')
         issue = payload.get('issue', {})
         issue_num = issue.get('number')
-        issue_title = (issue.get('title') or 'Untitled')[:60]
+        issue_title = (issue.get('title') or '')[:60]
         if not issue_num:
             return
-        self._cache_title(repo, issue_num, issue_title)
+        if issue_title:
+            self._cache_title(repo, issue_num, issue_title)
+
+        if action in self._SKIP_ISSUE_ACTIONS:
+            return
 
         label_map = {
             'opened': "Issue Created",
             'closed': "Issue Closed",
             'reopened': "Issue Reopened",
         }
-        label = label_map.get(action, f"Issue {action.title()}")
+        label = label_map.get(action)
+        if not label:
+            return  # skip unknown actions
 
+        if not issue_title:
+            issue_title = self._get_title(repo, issue_num) or 'Untitled'
         if self._dedup('issues', (repo, issue_num, action)):
             self._add_activity(day_str, label, f"#{issue_num}: {issue_title}", repo)
             activity_days.add(day_str)
@@ -473,14 +601,15 @@ class GitHubActivityTracker:
     # ═══════════════════════════════════════════════════════════════════
 
     def _search_commits(self) -> Set[str]:
-        """Search for commits by this user in the org.
+        """Search for commits in the org (by this user, or all users in org mode).
 
         Note: GitHub's commit search `author:` qualifier does fuzzy matching
         on the git author name, not just the GitHub login. We post-filter
         results by .author.login to avoid false positives.
         """
         activity_days = set()
-        query = (f'org:{self.org} author:{self.username} '
+        author_part = f' author:{self.username}' if self.username else ''
+        query = (f'org:{self.org}{author_part} '
                  f'committer-date:{self._start_str()}..{self._search_end_date_str()}')
 
         cmd = [
@@ -498,10 +627,13 @@ class GitHubActivityTracker:
             return activity_days
 
         for data in self._parse_lines(result.stdout):
-            # Post-filter: verify the GitHub login matches exactly
             author_login = data.get('author_login', '')
-            if author_login and author_login.lower() != self.username.lower():
-                continue
+            # Post-filter: in single-user mode, verify the GitHub login matches
+            if self.username:
+                if author_login and author_login.lower() != self.username.lower():
+                    continue
+            else:
+                self._current_actor = author_login or 'unknown'
             sha = data.get('sha', '')
             if not self._dedup('commits', sha):
                 continue
@@ -515,20 +647,23 @@ class GitHubActivityTracker:
             self._add_activity(day_str, "Commit", f"{sha[:7]}: {msg}", repo)
             activity_days.add(day_str)
 
+        self._current_actor = None
         if self.verbose:
             print(f"  Commit search: {len(activity_days)} active days")
         return activity_days
 
     def _search_prs_created(self) -> Set[str]:
-        """Search for PRs created by this user."""
+        """Search for PRs created (by this user, or all users in org mode)."""
         activity_days = set()
-        query = (f'org:{self.org} author:{self.username} type:pr '
+        author_part = f' author:{self.username}' if self.username else ''
+        query = (f'org:{self.org}{author_part} type:pr '
                  f'created:{self._start_str()}..{self._search_end_date_str()}')
 
         cmd = [
             'gh', 'api', f'search/issues?q={quote_plus(query)}&per_page=100',
             '--paginate',
-            '--jq', '.items[] | {number, created_at, title, repo: .repository_url}',
+            '--jq', '.items[] | {number, created_at, title, '
+                    'repo: .repository_url, author: .user.login}',
         ]
 
         result = self._run_gh(cmd, category='search')
@@ -536,6 +671,8 @@ class GitHubActivityTracker:
             return activity_days
 
         for data in self._parse_lines(result.stdout):
+            if not self.username:
+                self._current_actor = data.get('author', '') or 'unknown'
             pr_num = data.get('number')
             repo = self._repo_short(data.get('repo', ''))
             if not self._dedup('prs', (repo, pr_num, 'created')):
@@ -550,20 +687,23 @@ class GitHubActivityTracker:
             self._add_activity(day_str, "PR Created", f"#{pr_num}: {title}", repo)
             activity_days.add(day_str)
 
+        self._current_actor = None
         if self.verbose:
             print(f"  PR created search: {len(activity_days)} active days")
         return activity_days
 
     def _search_prs_merged(self) -> Set[str]:
-        """Search for PRs merged by this user."""
+        """Search for PRs merged (by this user, or all users in org mode)."""
         activity_days = set()
-        query = (f'org:{self.org} author:{self.username} type:pr is:merged '
+        author_part = f' author:{self.username}' if self.username else ''
+        query = (f'org:{self.org}{author_part} type:pr is:merged '
                  f'merged:{self._start_str()}..{self._search_end_date_str()}')
 
         cmd = [
             'gh', 'api', f'search/issues?q={quote_plus(query)}&per_page=100',
             '--paginate',
-            '--jq', '.items[] | {number, closed_at, title, repo: .repository_url}',
+            '--jq', '.items[] | {number, closed_at, title, '
+                    'repo: .repository_url, author: .user.login}',
         ]
 
         result = self._run_gh(cmd, category='search')
@@ -571,6 +711,8 @@ class GitHubActivityTracker:
             return activity_days
 
         for data in self._parse_lines(result.stdout):
+            if not self.username:
+                self._current_actor = data.get('author', '') or 'unknown'
             pr_num = data.get('number')
             repo = self._repo_short(data.get('repo', ''))
             if not self._dedup('prs', (repo, pr_num, 'merged')):
@@ -586,20 +728,23 @@ class GitHubActivityTracker:
             self._add_activity(day_str, "PR Merged", f"#{pr_num}: {title}", repo)
             activity_days.add(day_str)
 
+        self._current_actor = None
         if self.verbose:
             print(f"  PR merged search: {len(activity_days)} active days")
         return activity_days
 
     def _search_issues(self) -> Set[str]:
-        """Search for issues created by this user."""
+        """Search for issues created (by this user, or all users in org mode)."""
         activity_days = set()
-        query = (f'org:{self.org} author:{self.username} type:issue '
+        author_part = f' author:{self.username}' if self.username else ''
+        query = (f'org:{self.org}{author_part} type:issue '
                  f'created:{self._start_str()}..{self._search_end_date_str()}')
 
         cmd = [
             'gh', 'api', f'search/issues?q={quote_plus(query)}&per_page=100',
             '--paginate',
-            '--jq', '.items[] | {number, created_at, title, repo: .repository_url}',
+            '--jq', '.items[] | {number, created_at, title, '
+                    'repo: .repository_url, author: .user.login}',
         ]
 
         result = self._run_gh(cmd, category='search')
@@ -607,6 +752,8 @@ class GitHubActivityTracker:
             return activity_days
 
         for data in self._parse_lines(result.stdout):
+            if not self.username:
+                self._current_actor = data.get('author', '') or 'unknown'
             issue_num = data.get('number')
             repo = self._repo_short(data.get('repo', ''))
             if not self._dedup('issues', (repo, issue_num, 'opened')):
@@ -621,6 +768,7 @@ class GitHubActivityTracker:
             self._add_activity(day_str, "Issue Created", f"#{issue_num}: {title}", repo)
             activity_days.add(day_str)
 
+        self._current_actor = None
         if self.verbose:
             print(f"  Issue search: {len(activity_days)} active days")
         return activity_days
@@ -1027,6 +1175,99 @@ class GitHubActivityTracker:
 
         return all_days
 
+    def run_org(self) -> Set[str]:
+        """Org-wide mode: fetch all activity across the org (no user filter).
+
+        Uses org events API + org-wide search. Skips per-repo fallback
+        since it would be too expensive without user scoping.
+        """
+        all_days = set()
+
+        # Layer 1: Org events
+        if self.verbose:
+            print("=== Layer 1: Org Events API ===")
+        all_days.update(self._fetch_org_events())
+
+        # Layer 2: Org-wide search
+        if self.verbose:
+            print("\n=== Layer 2: Org-wide Search ===")
+        all_days.update(self._search_commits())
+        all_days.update(self._search_prs_created())
+        all_days.update(self._search_prs_merged())
+        all_days.update(self._search_issues())
+
+        return all_days
+
+
+def _parse_since(since_str: str) -> Tuple[datetime, datetime]:
+    """Parse a --since value into a [start, end) date range.
+
+    Supported formats:
+        today        – from start of today to start of tomorrow
+        yesterday    – from start of yesterday to start of today
+        Nd           – last N days (e.g. 7d = last 7 days including today)
+        YYYY-MM-DD   – from that date to start of tomorrow
+    """
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow = today + timedelta(days=1)
+
+    val = since_str.strip().lower()
+    if val == 'today':
+        return today, tomorrow
+    elif val == 'yesterday':
+        return today - timedelta(days=1), today
+    elif val.endswith('d') and val[:-1].isdigit():
+        n = int(val[:-1])
+        return today - timedelta(days=n - 1), tomorrow
+    else:
+        # Try YYYY-MM-DD
+        try:
+            start = datetime.strptime(val, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+            return start, tomorrow
+        except ValueError:
+            print(f"Error: unrecognized --since value '{since_str}'. "
+                  f"Use: today, yesterday, Nd (e.g. 7d), or YYYY-MM-DD.", file=sys.stderr)
+            sys.exit(1)
+
+
+def _run_tracker(org: str, username: str, year: int, month: int, strategy: str,
+                 verbose: bool, start_date: datetime = None, end_date: datetime = None,
+                 authenticated_user: str = None):
+    """Create a tracker, validate, run, and return (tracker, sorted_days)."""
+    tracker = GitHubActivityTracker(org, username, year, month,
+                                    verbose=verbose,
+                                    start_date=start_date, end_date=end_date,
+                                    authenticated_user=authenticated_user)
+
+    if not tracker.validate_user():
+        return None, []
+
+    tracker.rate_limit_before = tracker.snapshot_rate_limit()
+
+    if strategy == 'auto':
+        all_days = tracker.run_auto()
+    elif strategy == 'events-only':
+        all_days = tracker.run_events_only()
+    elif strategy == 'search-only':
+        all_days = tracker.run_search_only()
+    else:
+        all_days = set()
+
+    tracker.rate_limit_after = tracker.snapshot_rate_limit()
+    return tracker, sorted(all_days)
+
+
+def _format_period(args, start_date=None, end_date=None) -> str:
+    """Return a human-readable period string."""
+    if start_date is not None:
+        end_display = (end_date - timedelta(days=1)).strftime('%Y-%m-%d')
+        start_display = start_date.strftime('%Y-%m-%d')
+        if start_display == end_display:
+            return start_display
+        return f"{start_display} to {end_display}"
+    return f"{args.year}-{args.month:02d}"
+
+
 def main():
     today = datetime.now()
     first_of_this_month = today.replace(day=1)
@@ -1037,11 +1278,16 @@ def main():
     parser = argparse.ArgumentParser(
         description='Extract GitHub activity days using GitHub CLI')
     parser.add_argument('--org', required=True, help='GitHub organization name')
-    parser.add_argument('--user', required=True, help='GitHub username')
+    parser.add_argument('--user', nargs='+',
+                        help='GitHub username(s). Omit for org-wide mode; '
+                             'pass multiple for team mode.')
     parser.add_argument('--year', type=int, default=default_year,
                         help=f'Year (default: {default_year})')
     parser.add_argument('--month', type=int, default=default_month,
                         help=f'Month 1-12 (default: {default_month})')
+    parser.add_argument('--since',
+                        help='Recent period: today, yesterday, Nd (e.g. 7d), or YYYY-MM-DD. '
+                             'Overrides --year/--month.')
     parser.add_argument('--strategy',
                         choices=['auto', 'events-only', 'search-only'],
                         default='auto',
@@ -1061,86 +1307,208 @@ def main():
         args.strategy = method_map[args.method]
         print(f"Note: --method is deprecated, use --strategy={args.strategy}", file=sys.stderr)
 
-    tracker = GitHubActivityTracker(args.org, args.user, args.year, args.month,
-                                    verbose=args.verbose)
+    # Parse --since into a custom date range
+    custom_start = custom_end = None
+    if args.since:
+        custom_start, custom_end = _parse_since(args.since)
 
-    if not tracker.check_gh_cli():
+    users = args.user or []
+    org_mode = len(users) == 0
+    team_mode = len(users) > 1
+
+    # Check gh CLI once and detect authenticated user
+    tmp_tracker = GitHubActivityTracker(args.org, users[0] if users else None,
+                                        args.year, args.month)
+    if not tmp_tracker.check_gh_cli():
         sys.exit(1)
+    auth_user = GitHubActivityTracker.get_authenticated_user()
 
-    if not tracker.validate_user():
-        sys.exit(1)
+    # --- Org-wide mode (no --user) ---
+    if org_mode:
+        if not custom_start:
+            print("Error: org-wide mode requires --since (e.g. --since yesterday, --since 7d).",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    # Snapshot rate limit before run to compute true HTTP request count
-    tracker.rate_limit_before = tracker.snapshot_rate_limit()
+        tracker = GitHubActivityTracker(args.org, None, args.year, args.month,
+                                        verbose=args.verbose,
+                                        start_date=custom_start, end_date=custom_end,
+                                        authenticated_user=auth_user)
+        tracker.rate_limit_before = tracker.snapshot_rate_limit()
+        all_days = tracker.run_org()
+        tracker.rate_limit_after = tracker.snapshot_rate_limit()
+        sorted_days = sorted(all_days)
 
-    if args.strategy == 'auto':
-        all_days = tracker.run_auto()
-    elif args.strategy == 'events-only':
-        all_days = tracker.run_events_only()
-    elif args.strategy == 'search-only':
-        all_days = tracker.run_search_only()
-    else:
-        all_days = set()
+        period = _format_period(args, custom_start, custom_end)
+        print(f"\n=== Org Activity Summary ===")
+        print(f"Organization: {args.org}")
+        print(f"Period: {period}")
 
-    # Snapshot rate limit after run
-    tracker.rate_limit_after = tracker.snapshot_rate_limit()
+        total_invocations = tracker.api_calls.get('total', 0)
+        http_requests = tracker.get_http_request_count()
+        if args.verbose:
+            if http_requests is not None:
+                print(f"\nGitHub API requests: {http_requests} (across {total_invocations} gh invocations)")
+            else:
+                print(f"\ngh invocations: {total_invocations} total")
+            for cat in sorted(k for k in tracker.api_calls if k != 'total'):
+                print(f"  {cat}: {tracker.api_calls[cat]}")
 
-    # Sort and display
-    sorted_days = sorted(list(all_days))
+        if sorted_days:
+            print(f"\nDetailed daily activity:")
+            for day in sorted_days:
+                activities = tracker.daily_activity.get(day, ["No detailed info"])
+                print(f"  {day}:")
+                for activity in activities:
+                    print(f"    - {activity}")
+        else:
+            print("\nNo activity found for the specified period.")
 
-    print(f"\n=== Activity Summary ===")
-    print(f"User: {args.user}")
+        if args.output:
+            result = {
+                'organization': args.org,
+                'period': period,
+                'total_active_days': len(sorted_days),
+                'active_days': sorted_days,
+                'daily_activity_details': dict(tracker.daily_activity),
+                'api_usage': {
+                    'http_requests': http_requests,
+                    'gh_invocations': total_invocations,
+                    'by_category': {k: v for k, v in tracker.api_calls.items() if k != 'total'},
+                },
+                'generated_at': datetime.now().isoformat(),
+            }
+            with open(args.output, 'w') as f:
+                json.dump(result, f, indent=2)
+            print(f"\nResults saved to: {args.output}")
+        return
+
+    # --- Single-user mode (original behavior) ---
+    if not team_mode:
+        tracker, sorted_days = _run_tracker(
+            args.org, users[0], args.year, args.month, args.strategy,
+            args.verbose, start_date=custom_start, end_date=custom_end,
+            authenticated_user=auth_user)
+        if tracker is None:
+            sys.exit(1)
+
+        period = _format_period(args, custom_start, custom_end)
+        print(f"\n=== Activity Summary ===")
+        print(f"User: {users[0]}")
+        print(f"Organization: {args.org}")
+        print(f"Period: {period}")
+        if args.strategy != 'auto':
+            print(f"Strategy: {args.strategy}")
+        if tracker.events_coverage != 'none' and args.verbose:
+            print(f"Events coverage: {tracker.events_coverage}")
+
+        total_invocations = tracker.api_calls.get('total', 0)
+        http_requests = tracker.get_http_request_count()
+        if args.verbose:
+            if http_requests is not None:
+                print(f"\nGitHub API requests: {http_requests} (across {total_invocations} gh invocations)")
+            else:
+                print(f"\ngh invocations: {total_invocations} total")
+            for cat in sorted(k for k in tracker.api_calls if k != 'total'):
+                print(f"  {cat}: {tracker.api_calls[cat]}")
+
+        if sorted_days:
+            print(f"\nDetailed daily activity:")
+            for day in sorted_days:
+                activities = tracker.daily_activity.get(day, ["No detailed info"])
+                print(f"  {day}:")
+                for activity in activities:
+                    print(f"    - {activity}")
+        else:
+            print("\nNo activity found for the specified period.")
+
+        if args.output:
+            result = {
+                'user': users[0],
+                'organization': args.org,
+                'year': args.year,
+                'month': args.month,
+                'period': period,
+                'strategy': args.strategy,
+                'events_coverage': tracker.events_coverage,
+                'total_active_days': len(sorted_days),
+                'active_days': sorted_days,
+                'daily_activity_details': dict(tracker.daily_activity),
+                'api_usage': {
+                    'http_requests': http_requests,
+                    'gh_invocations': total_invocations,
+                    'by_category': {k: v for k, v in tracker.api_calls.items() if k != 'total'},
+                },
+                'generated_at': datetime.now().isoformat(),
+            }
+            with open(args.output, 'w') as f:
+                json.dump(result, f, indent=2)
+            print(f"\nResults saved to: {args.output}")
+        return
+
+    # --- Team mode (multiple users) ---
+    period = _format_period(args, custom_start, custom_end)
+    print(f"\n=== Team Activity Summary ===")
     print(f"Organization: {args.org}")
-    print(f"Period: {args.year}-{args.month:02d}")
+    print(f"Period: {period}")
+    print(f"Team: {', '.join(users)}")
     if args.strategy != 'auto':
         print(f"Strategy: {args.strategy}")
-    if tracker.events_coverage != 'none' and args.verbose:
-        print(f"Events coverage: {tracker.events_coverage}")
 
-    # API usage stats
-    total_invocations = tracker.api_calls.get('total', 0)
-    http_requests = tracker.get_http_request_count()
-    if args.verbose:
-        if http_requests is not None:
-            print(f"\nGitHub API requests: {http_requests} (across {total_invocations} gh invocations)")
-        else:
-            print(f"\ngh invocations: {total_invocations} total")
-        for cat in sorted(k for k in tracker.api_calls if k != 'total'):
-            print(f"  {cat}: {tracker.api_calls[cat]}")
+    # Collect activities from all users, keyed by day
+    # Each entry: (day, username, [activities])
+    merged: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    all_sorted_days = set()
+    failed_users = []
 
-    if sorted_days:
-        print(f"\nDetailed daily activity:")
+    for user in users:
+        if args.verbose:
+            print(f"\n--- Fetching activity for {user} ---")
+        tracker, sorted_days = _run_tracker(
+            args.org, user, args.year, args.month, args.strategy,
+            args.verbose, start_date=custom_start, end_date=custom_end,
+            authenticated_user=auth_user)
+        if tracker is None:
+            failed_users.append(user)
+            continue
+        all_sorted_days.update(sorted_days)
         for day in sorted_days:
-            activities = tracker.daily_activity.get(day, ["No detailed info"])
+            for activity in tracker.daily_activity.get(day, []):
+                merged[day].append((user, activity))
+
+    if failed_users:
+        print(f"\nWarning: could not fetch activity for: {', '.join(failed_users)}",
+              file=sys.stderr)
+
+    sorted_all_days = sorted(all_sorted_days)
+
+    if sorted_all_days:
+        print(f"\nDetailed daily activity:")
+        for day in sorted_all_days:
             print(f"  {day}:")
-            for activity in activities:
-                print(f"    - {activity}")
+            for user, activity in merged[day]:
+                print(f"    - [{user}] {activity}")
     else:
         print("\nNo activity found for the specified period.")
 
-    # Save to file if requested
     if args.output:
         result = {
-            'user': args.user,
             'organization': args.org,
+            'team': users,
+            'period': period,
             'year': args.year,
             'month': args.month,
             'strategy': args.strategy,
-            'events_coverage': tracker.events_coverage,
-            'total_active_days': len(sorted_days),
-            'active_days': sorted_days,
-            'daily_activity_details': dict(tracker.daily_activity),
-            'api_usage': {
-                'http_requests': http_requests,
-                'gh_invocations': total_invocations,
-                'by_category': {k: v for k, v in tracker.api_calls.items() if k != 'total'},
+            'total_active_days': len(sorted_all_days),
+            'active_days': sorted_all_days,
+            'daily_activity_details': {
+                day: [f"[{u}] {a}" for u, a in entries]
+                for day, entries in merged.items()
             },
             'generated_at': datetime.now().isoformat(),
         }
-
         with open(args.output, 'w') as f:
             json.dump(result, f, indent=2)
-
         print(f"\nResults saved to: {args.output}")
 
 
