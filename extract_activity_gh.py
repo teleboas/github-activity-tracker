@@ -9,6 +9,7 @@ Uses the GitHub CLI for simpler and more reliable API access.
 import subprocess
 import json
 import argparse
+import os
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Set, List, Dict
@@ -29,8 +30,11 @@ class GitHubCLIActivityTracker:
         # Global deduplication tracking
         self.seen_commits = set()  # Track commit SHAs globally
         self.seen_prs = set()  # Track PR (repo, number) tuples globally
-        # API call counter
-        self.api_call_count = 0
+        # API usage counters
+        self.api_call_count = 0      # HTTP requests actually sent
+        self.gh_command_count = 0    # gh subprocesses spawned
+        # Per-repo comment scans already done in this run, keyed by (kind, repo)
+        self.comment_scans = {}
         # Common variations of the username to search for
         self.username_variations = [
             username.lower(),
@@ -84,10 +88,50 @@ class GitHubCLIActivityTracker:
 
         return start_date, end_date
 
+    @staticmethod
+    def _count_requests(stderr) -> int:
+        """Count the HTTP requests recorded in a GH_DEBUG=api stderr stream."""
+        if not stderr:
+            return 0
+        return sum(1 for line in stderr.splitlines()
+                   if line.startswith('* Request to '))
+
     def _run_gh_command(self, cmd: List[str], **kwargs) -> subprocess.CompletedProcess:
-        """Run a gh command and track API calls."""
-        self.api_call_count += 1
-        return subprocess.run(cmd, **kwargs)
+        """Run a gh command and count the HTTP requests it makes.
+
+        A single gh subprocess can send many requests: --paginate walks one
+        request per page inside it, and `gh pr list` issues its own GraphQL
+        calls. Counting subprocesses understates real API usage by an order
+        of magnitude, so count the requests instead. GH_DEBUG=api makes gh
+        log every request to stderr, which every caller already captures.
+        The token is redacted in that output.
+        """
+        kwargs.setdefault('env', dict(os.environ, GH_DEBUG='api'))
+        self.gh_command_count += 1
+        try:
+            result = subprocess.run(cmd, **kwargs)
+        except subprocess.CalledProcessError as e:
+            self.api_call_count += self._count_requests(e.stderr)
+            raise
+        self.api_call_count += self._count_requests(result.stderr)
+        return result
+
+    def _scan_repo_comments(self, kind: str, repo_name: str, start_date: datetime,
+                            end_date: datetime) -> Set[str]:
+        """Scan a repository's comments, at most once per run.
+
+        These scans walk a repository's entire comment history, and the
+        search path asks for the same repository once per matching item. On
+        a busy repository that repeats a 50-page walk dozens of times for
+        identical data. Caching the result is safe because the side effect,
+        add_activity, already discards duplicate entries.
+        """
+        key = (kind, repo_name)
+        if key not in self.comment_scans:
+            scan = (self._get_issue_comments_for_repo if kind == 'issue'
+                    else self._get_pr_comments_for_repo)
+            self.comment_scans[key] = scan(repo_name, start_date, end_date)
+        return self.comment_scans[key]
     
     def add_activity(self, date_str: str, activity_type: str, details: str, repo: str = None):
         """Add detailed activity for a specific date."""
@@ -165,11 +209,11 @@ class GitHubCLIActivityTracker:
             activity_days.update(issue_days)
 
             # Get issue comments
-            issue_comment_days = self._get_issue_comments_for_repo(repo_name, start_date, end_date)
+            issue_comment_days = self._scan_repo_comments('issue', repo_name, start_date, end_date)
             activity_days.update(issue_comment_days)
 
             # Get PR comments
-            pr_comment_days = self._get_pr_comments_for_repo(repo_name, start_date, end_date)
+            pr_comment_days = self._scan_repo_comments('pr', repo_name, start_date, end_date)
             activity_days.update(pr_comment_days)
 
             # Get commit comments
@@ -242,9 +286,15 @@ class GitHubCLIActivityTracker:
         
         try:
             # Get recent commits and filter by date and author locally
+            # since= filters on the committer date, which is never earlier
+            # than the author date this report counts by, so a commit authored
+            # within the month cannot be filtered out here. There is no until=:
+            # that reasoning does not hold at the top of the range, and the
+            # local date check below bounds it anyway.
+            since = start_date.strftime('%Y-%m-%dT%H:%M:%SZ')
             cmd = [
                 'gh', 'api', 
-                f'repos/{self.org}/{repo_name}/commits?per_page=100',
+                f'repos/{self.org}/{repo_name}/commits?per_page=100&since={since}',
                 '--paginate',
                 '--jq', '.[] | {date: .commit.author.date, login: (.author.login // ""), name: .commit.author.name, email: .commit.author.email, sha: .sha, message: .commit.message}'
             ]
@@ -462,8 +512,12 @@ class GitHubCLIActivityTracker:
         activity_days = set()
 
         try:
+            # since= filters on updated_at, which is never earlier than
+            # created_at, so a comment created within the month cannot be
+            # filtered out. The local check below bounds the top of the range.
+            since = start_date.strftime('%Y-%m-%dT%H:%M:%SZ')
             cmd = [
-                'gh', 'api', f'repos/{self.org}/{repo_name}/issues/comments?per_page=100',
+                'gh', 'api', f'repos/{self.org}/{repo_name}/issues/comments?per_page=100&since={since}',
                 '--paginate',
                 '--jq', '.[] | {created_at: .created_at, user: .user.login, issue_url: .issue_url, id: .id}'
             ]
@@ -501,8 +555,11 @@ class GitHubCLIActivityTracker:
 
         # Get review comments (comments on specific code lines)
         try:
+            # Same reasoning as the issue comments above: updated_at is never
+            # earlier than created_at.
+            since = start_date.strftime('%Y-%m-%dT%H:%M:%SZ')
             cmd = [
-                'gh', 'api', f'repos/{self.org}/{repo_name}/pulls/comments?per_page=100',
+                'gh', 'api', f'repos/{self.org}/{repo_name}/pulls/comments?per_page=100&since={since}',
                 '--paginate',
                 '--jq', '.[] | {created_at: .created_at, user: .user.login, pull_request_url: .pull_request_url, id: .id}'
             ]
@@ -756,14 +813,16 @@ class GitHubCLIActivityTracker:
                             repo_name = repo_url.split('/')[-1] if repo_url else 'unknown'
                             is_pr = item_info.get('is_pr') is not None
 
-                            # Fetch comments for this issue/PR
+                            # Fetch comments for this issue/PR. The scans are
+                            # per repository, so many search hits collapse onto
+                            # one scan each.
                             if is_pr:
                                 # Check PR review comments
-                                pr_comment_days = self._get_pr_comments_for_repo(repo_name, start_date, end_date)
+                                pr_comment_days = self._scan_repo_comments('pr', repo_name, start_date, end_date)
                                 activity_days.update(pr_comment_days)
                             else:
                                 # Check issue comments
-                                issue_comment_days = self._get_issue_comments_for_repo(repo_name, start_date, end_date)
+                                issue_comment_days = self._scan_repo_comments('issue', repo_name, start_date, end_date)
                                 activity_days.update(issue_comment_days)
 
                         except (json.JSONDecodeError, KeyError):
@@ -835,7 +894,8 @@ def main():
     print(f"Organization: {args.org}")
     print(f"Period: {args.year}-{args.month:02d}")
     print(f"Total active days: {len(sorted_days)}")
-    print(f"GitHub API calls made: {tracker.api_call_count}")
+    print(f"GitHub API requests made: {tracker.api_call_count}")
+    print(f"gh commands run: {tracker.gh_command_count}")
     
     if sorted_days:
         print(f"\nDetailed daily activity:")
