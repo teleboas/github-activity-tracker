@@ -168,6 +168,48 @@ class GitHubCLIActivityTracker:
                 print(f"Error parsing repository data: {e}")
             return []
 
+    def _get_active_repos(self, start_date: datetime, end_date: datetime) -> Set[str]:
+        """Find repositories the user touched in the month, by search.
+
+        get_org_repos orders by last push, which measures code pushes rather
+        than this user's activity, so a repository dormant for months can
+        still carry a review or a comment made during the month. No cutoff on
+        that ordering catches those: in one observed month the user's active
+        repositories ranked as low as 40th, while only 16 were active at all.
+        Ask search which repositories the user actually touched, and scan
+        those on top of the ranked list.
+        """
+        repos = set()
+        start = start_date.strftime('%Y-%m-%d')
+        end = end_date.strftime('%Y-%m-%d')
+        searches = [
+            # author-date matches the date this report counts commits by
+            (f'org:{self.org} author:{self.username} author-date:{start}..{end}',
+             'search/commits', '.items[].repository.name'),
+            # involves covers authoring, commenting, assignment and mentions
+            (f'org:{self.org} involves:{self.username} updated:>={start}',
+             'search/issues', '.items[] | (.repository_url|split("/")|last)'),
+        ]
+
+        for query, endpoint, jq in searches:
+            try:
+                cmd = [
+                    'gh', 'api', f'{endpoint}?q={quote_plus(query)}&per_page=100',
+                    '--paginate',
+                    '--jq', jq
+                ]
+                result = self._run_gh_command(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    for line in result.stdout.strip().split('\n'):
+                        name = line.strip()
+                        if name and name != 'null':
+                            repos.add(name)
+            except Exception as e:
+                if self.verbose:
+                    print(f"Warning: repository discovery via {endpoint} failed: {e}")
+
+        return repos
+
     def get_user_activity(self, repo_limit: int = 20, include_repos: List[str] = None) -> Set[str]:
         """Get all activity days for the user in the organization."""
         if not self.check_gh_cli():
@@ -188,6 +230,15 @@ class GitHubCLIActivityTracker:
             for repo in include_repos:
                 if repo not in repos:
                     repos.append(repo)
+
+        # Add repositories the ranked list misses, so a dormant repository the
+        # user reviewed or commented in this month is still scanned.
+        added = [repo for repo in sorted(self._get_active_repos(start_date, end_date))
+                 if repo not in repos]
+        repos.extend(added)
+        if self.verbose and added:
+            print(f"Search added {len(added)} repositories the ranking missed: "
+                  f"{', '.join(added)}")
 
         if self.verbose:
             print(f"Checking {len(repos)} repositories in {self.org}")
@@ -223,6 +274,10 @@ class GitHubCLIActivityTracker:
             # Get wiki edits
             wiki_days = self._get_wiki_edits_for_repo(repo_name, start_date, end_date)
             activity_days.update(wiki_days)
+
+        # Reviews are looked up once for the whole organisation rather than per
+        # repository, so this sits outside the loop.
+        activity_days.update(self._get_review_days(start_date, end_date))
 
         return activity_days
 
@@ -350,7 +405,7 @@ class GitHubCLIActivityTracker:
         return activity_days
 
     def _get_prs_for_repo(self, repo_name: str, start_date: datetime, end_date: datetime) -> Set[str]:
-        """Get pull request creation and review days for the user in a specific repository."""
+        """Get pull request creation days for the user in a specific repository."""
         activity_days = set()
         
         # Get PRs created by the user
@@ -393,45 +448,62 @@ class GitHubCLIActivityTracker:
             if self.verbose:
                 print(f"  Warning: Error checking PRs in {repo_name}: {e}")
         
-        # Get PR reviews by the user
+        # Reviews are not collected here. See _get_review_days, which asks
+        # which pull requests this user reviewed rather than inspecting every
+        # pull request in the repository.
+        return activity_days
+
+    def _get_review_days(self, start_date: datetime, end_date: datetime) -> Set[str]:
+        """Get review days across the organisation, driven by search.
+
+        Listing every pull request in a repository and fetching each one's
+        reviews costs a request per pull request, and the cost grows every
+        month, because any pull request touched since the month started has
+        to be inspected. The search API answers the question directly:
+        reviewed-by returns only the pull requests this user submitted a
+        review on, which is a far smaller set and does not grow with
+        unrelated activity.
+        """
+        activity_days = set()
+        since = start_date.strftime('%Y-%m-%d')
+        query = (f'org:{self.org} type:pr reviewed-by:{self.username} '
+                 f'updated:>={since}')
+
         try:
-            # Get all PRs and check for reviews by our user
             cmd = [
-                'gh', 'api', f'repos/{self.org}/{repo_name}/pulls?state=all',
+                'gh', 'api', f'search/issues?q={quote_plus(query)}&per_page=100',
                 '--paginate',
-                '--jq', '.[] | {number: .number, updated_at: .updated_at}'
+                '--jq', '.items[] | {number: .number, repo: .repository_url}'
             ]
-            
+
             result = self._run_gh_command(cmd, capture_output=True, text=True)
-            
+
             if result.returncode == 0:
                 for line in result.stdout.strip().split('\n'):
                     if line and line != 'null':
                         try:
-                            pr_data = json.loads(line)
-                            pr_number = pr_data['number']
-                            updated_at = datetime.fromisoformat(pr_data['updated_at'].replace('Z', '+00:00'))
-                            
-                            # A PR reviewed during the month must have been
-                            # updated at or after the month started. Its last
-                            # update can be any time after that, so there is no
-                            # upper bound to apply here: capping it drops every
-                            # review on a PR that was touched again later.
-                            if updated_at >= start_date:
-                                review_days = self._get_reviews_for_pr(repo_name, pr_number, start_date, end_date)
-                                activity_days.update(review_days)
-                                
+                            item = json.loads(line)
+                            repo_url = item.get('repo', '')
+                            if not repo_url:
+                                continue
+                            repo_name = repo_url.split('/')[-1]
+                            review_days = self._get_reviews_for_pr(
+                                repo_name, item['number'], start_date, end_date)
+                            activity_days.update(review_days)
                         except (json.JSONDecodeError, KeyError):
                             continue
-            
+
+            if self.verbose:
+                print(f"Found {len(activity_days)} days with PR reviews")
+
         except subprocess.CalledProcessError:
             pass
         except Exception as e:
             if self.verbose:
-                print(f"  Warning: Error checking PR reviews in {repo_name}: {e}")
-        
+                print(f"Warning: Error checking PR reviews: {e}")
+
         return activity_days
-    
+
     def _get_reviews_for_pr(self, repo_name: str, pr_number: int, start_date: datetime, end_date: datetime) -> Set[str]:
         """Get review days for a specific PR."""
         review_days = set()
