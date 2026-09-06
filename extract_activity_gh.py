@@ -35,6 +35,8 @@ class GitHubCLIActivityTracker:
         self.gh_command_count = 0    # gh subprocesses spawned
         # Per-repo comment scans already done in this run, keyed by (kind, repo)
         self.comment_scans = {}
+        # Calls that failed, so an incomplete report can say so
+        self.failures = []
         # Common variations of the username to search for
         self.username_variations = [
             username.lower(),
@@ -89,6 +91,30 @@ class GitHubCLIActivityTracker:
         return start_date, end_date
 
     @staticmethod
+    def _describe_command(cmd: List[str]) -> str:
+        """Name a gh command well enough to identify it in a warning."""
+        if len(cmd) >= 3 and cmd[1] == 'api':
+            target = cmd[2].split('?')[0]
+        else:
+            target = ' '.join(cmd[1:3])
+        if '--repo' in cmd:
+            target = f"{target} ({cmd[cmd.index('--repo') + 1]})"
+        return target
+
+    def _record_failure(self, context: str, detail: str = '') -> None:
+        """Record a failed call, and say so at once.
+
+        A swallowed failure quietly drops activity from the report: the run
+        still looks clean, and two runs of the same month disagree with no
+        visible reason. Anything that costs the report data has to be
+        audible, so warn on stderr now and list it in the summary later.
+        """
+        lines = [line for line in (detail or '').splitlines() if line.strip()]
+        summary = lines[-1].strip()[:200] if lines else 'no error output'
+        self.failures.append(f"{context}: {summary}")
+        print(f"Warning: {context} failed: {summary}", file=sys.stderr)
+
+    @staticmethod
     def _count_requests(stderr) -> int:
         """Count the HTTP requests recorded in a GH_DEBUG=api stderr stream."""
         if not stderr:
@@ -112,8 +138,11 @@ class GitHubCLIActivityTracker:
             result = subprocess.run(cmd, **kwargs)
         except subprocess.CalledProcessError as e:
             self.api_call_count += self._count_requests(e.stderr)
+            self._record_failure(self._describe_command(cmd), e.stderr)
             raise
         self.api_call_count += self._count_requests(result.stderr)
+        if result.returncode != 0:
+            self._record_failure(self._describe_command(cmd), result.stderr)
         return result
 
     def _scan_repo_comments(self, kind: str, repo_name: str, start_date: datetime,
@@ -160,12 +189,10 @@ class GitHubCLIActivityTracker:
             repos_data = json.loads(result.stdout)
             return [repo['name'] for repo in repos_data]
         except subprocess.CalledProcessError as e:
-            if self.verbose:
-                print(f"Error fetching repositories: {e}")
+            self._record_failure("fetching the repository list", str(e))
             return []
         except json.JSONDecodeError as e:
-            if self.verbose:
-                print(f"Error parsing repository data: {e}")
+            self._record_failure("parsing the repository list", str(e))
             return []
 
     def _get_active_repos(self, start_date: datetime, end_date: datetime) -> Set[str]:
@@ -205,8 +232,7 @@ class GitHubCLIActivityTracker:
                         if name and name != 'null':
                             repos.add(name)
             except Exception as e:
-                if self.verbose:
-                    print(f"Warning: repository discovery via {endpoint} failed: {e}")
+                self._record_failure(f"repository discovery via {endpoint} failed", str(e))
 
         return repos
 
@@ -330,8 +356,7 @@ class GitHubCLIActivityTracker:
         except subprocess.CalledProcessError:
             pass
         except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking wiki edits in {repo_name}: {e}")
+            self._record_failure(f"Error checking wiki edits in {repo_name}", str(e))
 
         return activity_days
 
@@ -399,8 +424,7 @@ class GitHubCLIActivityTracker:
             # Repository might not exist or no access
             pass
         except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking commits in {repo_name}: {e}")
+            self._record_failure(f"Error checking commits in {repo_name}", str(e))
         
         return activity_days
 
@@ -445,8 +469,7 @@ class GitHubCLIActivityTracker:
         except subprocess.CalledProcessError:
             pass
         except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking PRs in {repo_name}: {e}")
+            self._record_failure(f"Error checking PRs in {repo_name}", str(e))
         
         # Reviews are not collected here. See _get_review_days, which asks
         # which pull requests this user reviewed rather than inspecting every
@@ -499,8 +522,7 @@ class GitHubCLIActivityTracker:
         except subprocess.CalledProcessError:
             pass
         except Exception as e:
-            if self.verbose:
-                print(f"Warning: Error checking PR reviews: {e}")
+            self._record_failure(f"Error checking PR reviews", str(e))
 
         return activity_days
 
@@ -574,8 +596,7 @@ class GitHubCLIActivityTracker:
         except subprocess.CalledProcessError:
             pass
         except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking issues in {repo_name}: {e}")
+            self._record_failure(f"Error checking issues in {repo_name}", str(e))
 
         return activity_days
 
@@ -616,8 +637,7 @@ class GitHubCLIActivityTracker:
         except subprocess.CalledProcessError:
             pass
         except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking issue comments in {repo_name}: {e}")
+            self._record_failure(f"Error checking issue comments in {repo_name}", str(e))
 
         return activity_days
 
@@ -658,8 +678,7 @@ class GitHubCLIActivityTracker:
         except subprocess.CalledProcessError:
             pass
         except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking PR comments in {repo_name}: {e}")
+            self._record_failure(f"Error checking PR comments in {repo_name}", str(e))
 
         return activity_days
 
@@ -694,8 +713,7 @@ class GitHubCLIActivityTracker:
         except subprocess.CalledProcessError:
             pass
         except Exception as e:
-            if self.verbose:
-                print(f"  Warning: Error checking commit comments in {repo_name}: {e}")
+            self._record_failure(f"Error checking commit comments in {repo_name}", str(e))
 
         return activity_days
 
@@ -770,8 +788,7 @@ class GitHubCLIActivityTracker:
                 print(f"Found {len(commit_days)} days with commits via search")
             
         except Exception as e:
-            if self.verbose:
-                print(f"Warning: Commit search failed: {e}")
+            self._record_failure(f"Commit search failed", str(e))
         
         # Search for pull requests
         try:
@@ -817,8 +834,7 @@ class GitHubCLIActivityTracker:
                     print(f"Found {len(pr_days)} additional days with PRs via search")
             
         except Exception as e:
-            if self.verbose:
-                print(f"Warning: PR search failed: {e}")
+            self._record_failure(f"PR search failed", str(e))
 
         # Search for issues created
         try:
@@ -858,8 +874,7 @@ class GitHubCLIActivityTracker:
                     print(f"Found {len(issue_days)} additional days with issues via search")
 
         except Exception as e:
-            if self.verbose:
-                print(f"Warning: Issue search failed: {e}")
+            self._record_failure(f"Issue search failed", str(e))
 
         # Search for issues/PRs where user commented (involves:USERNAME search)
         try:
@@ -904,8 +919,7 @@ class GitHubCLIActivityTracker:
                     print(f"Checked comments for issues/PRs where user was involved")
 
         except Exception as e:
-            if self.verbose:
-                print(f"Warning: Comment search failed: {e}")
+            self._record_failure(f"Comment search failed", str(e))
 
         return activity_days
 
@@ -968,6 +982,13 @@ def main():
     print(f"Total active days: {len(sorted_days)}")
     print(f"GitHub API requests made: {tracker.api_call_count}")
     print(f"gh commands run: {tracker.gh_command_count}")
+
+    if tracker.failures:
+        print(f"\nINCOMPLETE: {len(tracker.failures)} call(s) failed, so activity "
+              f"may be missing from this report:")
+        for failure in tracker.failures:
+            print(f"  - {failure}")
+        print("Re-run to see whether the failures were transient.")
     
     if sorted_days:
         print(f"\nDetailed daily activity:")
@@ -990,6 +1011,8 @@ def main():
             'active_days': sorted_days,
             'daily_activity_details': dict(tracker.daily_activity),
             'method_used': args.method,
+            'complete': not tracker.failures,
+            'failures': tracker.failures,
             'generated_at': datetime.now().isoformat()
         }
         
@@ -997,6 +1020,11 @@ def main():
             json.dump(result, f, indent=2)
         
         print(f"\nResults saved to: {args.output}")
+
+    # Exit non-zero when the report is known to be incomplete, so a scripted
+    # run does not treat a short report as a good one.
+    if tracker.failures:
+        sys.exit(1)
 
 
 if __name__ == '__main__':
