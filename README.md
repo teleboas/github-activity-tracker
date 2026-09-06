@@ -4,13 +4,13 @@ A Python tool to extract activity days for a specific GitHub user within an orga
 
 ## Features
 
-- **Dual Search Strategy**: Combines repository-by-repository checking with GitHub search API for comprehensive coverage
+- **Dual Strategy**: Combines repository-by-repository checking with the GitHub search API
 - **Comprehensive Activity Detection**: Tracks commits, pull requests, issues, comments, PR reviews, and wiki edits
+- **Repository Discovery**: Finds the repositories a user touched, rather than relying on a fixed cutoff
 - **Flexible Date Ranges**: Specify any year and month
 - **JSON Output**: Save results in structured format with detailed daily activity breakdown
-- **Rate Limit Friendly**: Handles GitHub API pagination and limits
-- **Wiki Support**: Tracks wiki edits via GitHub Events API
-- **Deduplication**: Automatically deduplicates activity found by both search methods
+- **Loud Failures**: A failed call is reported, not swallowed, so an incomplete report says so
+- **Deduplication**: Automatically deduplicates activity found by both methods
 
 ## Installation
 
@@ -40,11 +40,8 @@ python extract_activity_gh.py --org org-name --user username --method search
 # Specific user/org/date
 python extract_activity_gh.py --org org-name --user username --year 2024 --month 12
 
-# Include specific repos (useful for docs repos with active wikis)
-python extract_activity_gh.py --org org-name --user username --include-repos docs-repo-name,wiki-repo-name
-
-# Limit repo checks but include specific repos
-python extract_activity_gh.py --org org-name --user username --repo-limit 10 --include-repos docs-repo-name
+# Force a repo that only ever sees wiki edits or commit comments
+python extract_activity_gh.py --org org-name --user username --include-repos docs-repo-name
 
 # Save results to JSON
 python extract_activity_gh.py --org org-name --user username --output activity_report.json
@@ -56,10 +53,10 @@ python extract_activity_gh.py --org org-name --user username --output activity_r
 - `--year`: Year to analyze (default: last month's year)
 - `--month`: Month to analyze (default: last month)
 - `--method`: Method to use - 'repos', 'search', or 'both' (default: both)
-- `--repo-limit`: Number of most recent repos to check (default: 20)
-- `--include-repos`: Comma-separated list of repos to always include (e.g., "docs-repo-name,wiki-repo-name")
+- `--repo-limit`: Number of most recently pushed repos to check (default: 20). Repos found by search are checked on top of these, so this is a floor rather than a cap.
+- `--include-repos`: Comma-separated list of repos to always include. See [When to use `--include-repos`](#when-to-use---include-repos) — most repos no longer need it.
 - `--output`: Output file for JSON results
-- `--verbose`: Enable verbose output with API call tracking
+- `--verbose`: Enable verbose output. Failures are reported with or without it.
 
 ## Authentication
 
@@ -84,7 +81,8 @@ User: username
 Organization: org-name
 Period: 2025-08
 Total active days: 12
-GitHub API calls made: 45
+GitHub API requests made: 252
+gh commands run: 216
 
 Detailed daily activity:
   2025-08-01:
@@ -100,42 +98,114 @@ Detailed daily activity:
   ...
 ```
 
+`GitHub API requests made` counts HTTP requests, not subprocesses: a single
+`gh` command sends one request per page when it paginates, so the two numbers
+differ by roughly an order of magnitude on a full run.
+
 Activity types tracked:
 - **Commits**: Code commits to repositories
 - **PR Created**: Pull requests opened
 - **PR Review**: Formal pull request reviews
-- **PR Comment**: Comments on pull requests
+- **PR Comment**: Review comments on pull request code
 - **Issue Created**: New issues opened
-- **Issue Comment**: Comments on issues
+- **Issue Comment**: Comments on issues, including the conversation on a pull request
 - **Commit Comment**: Comments on specific commits
 - **Wiki Edit**: Edits to repository wikis
 
+## Incomplete reports
+
+Any failed call is printed to stderr as it happens and listed at the end of the
+summary:
+
+```
+INCOMPLETE: 2 call(s) failed, so activity may be missing from this report:
+  - repos/org-name/repo-name/commits: gh: Not Found (HTTP 404)
+  - issue list (org-name/repo-name): GraphQL: Could not resolve to a Repository
+Re-run to see whether the failures were transient.
+```
+
+The exit status is 1 when this happens, and the JSON output carries a
+`complete` flag and a `failures` list. A run that prints no such block lost
+nothing to a failed call.
+
 ## How It Works
 
-The tool uses two complementary methods to ensure comprehensive activity tracking:
+The tool uses two complementary methods:
 
 1. **Repository Method** (`--method repos`):
-   - Fetches the most recently updated repositories in the organization
-   - Checks each repository individually for all activity types
+   - Checks each selected repository for commits, issues, comments and wiki edits
    - More thorough but makes more API calls
-   - Use `--repo-limit` to control how many repos to check (default: 20)
-   - Use `--include-repos` to ensure specific repos are always checked (useful for docs repos with wikis)
 
 2. **Search Method** (`--method search`):
-   - Uses GitHub's search API to find commits, PRs, and issues
+   - Uses GitHub's search API to find commits, PRs and issues
    - Faster with fewer API calls
-   - May miss some activity types (like wiki edits or some comments)
-   - Good for quick checks across many repositories
+   - Does not see wiki edits or commit comments
 
 3. **Both Methods** (`--method both`, default):
-   - Runs both methods and combines results
-   - Automatically deduplicates activity
+   - Runs both and combines the results, deduplicated
    - Recommended for accurate, comprehensive tracking
+
+### Which repositories get checked
+
+Repository selection is the union of two sources:
+
+- the `--repo-limit` most recently **pushed** repositories in the organization
+- every repository the search API says the user touched that month
+
+The second matters because push order measures code pushes, not one person's
+activity. A repository dormant for months still collects reviews, comments and
+issues, and no cutoff on the ranked list catches those: in one real month the
+user's active repositories ranked as low as 40th while only 16 were active at
+all, so raising `--repo-limit` would have scanned the wrong repositories more
+expensively.
+
+PR reviews are looked up by asking search which pull requests the user reviewed,
+rather than by inspecting every pull request in every repository.
+
+### When to use `--include-repos`
+
+Search discovery covers commits, pull requests, issues and their comments, so
+those repositories are found whatever their rank. Two activity types are
+invisible to it:
+
+- **wiki edits**, which come from the parent repository's events feed and are
+  indexed by no search qualifier
+- **commit comments**, which `involves:` does not cover
+
+So `--include-repos` is worth setting only for a repository where the user
+edits the wiki or comments on commits but does nothing else. If they also open
+an issue or a pull request there, discovery finds it on its own.
+
+Pass the **parent repository name**, never the `.wiki` suffix. A wiki is not a
+repository in the REST API, so `docs-repo-name.wiki` can only produce 404s,
+while `docs-repo-name` reads both the code and the wiki activity.
+
+## Which day an activity counts towards
+
+Commit days come from the search API, which preserves the author's UTC offset,
+so work done at 00:50 +02:00 counts as that day rather than the previous one in
+UTC. Commits whose author date carries no offset, which is common for commits
+made on a server, fall back to UTC.
+
+Everything else — issues, pull requests, reviews and comments — is only exposed
+by GitHub in UTC, and is counted on the UTC day.
+
+## Limitations
+
+- **Wiki edits expire.** They are read from GitHub's repository events feed,
+  which only returns recent activity. The documented window is 90 days, and in
+  practice it can be considerably shorter: one docs repository reached back
+  about three weeks. Wiki edits for an older month cannot be recovered by
+  re-running, so keep the report generated at the time.
+- **Search caps at 1000 results**, so a month with more matching commits than
+  that will fall back to what the repository scan finds.
+- **Merge commits** carry the offset of whoever's environment created them,
+  which is usually but not always the person credited as author.
 
 ## Notes
 
 - The tool automatically handles API pagination
-- Tracks comprehensive activity: commits, PRs, issues, comments, reviews, and wiki edits
+- Commits and comments are filtered by date server-side, so a repository's full
+  history is not downloaded to find one month
 - Activity is automatically deduplicated when using both methods
-- Use `--verbose` flag to see detailed progress and API call statistics
-- The `--include-repos` parameter ensures important repositories (like documentation repos with active wikis) are always checked, regardless of `--repo-limit`
+- Use `--verbose` to see per-repository progress

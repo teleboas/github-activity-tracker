@@ -950,9 +950,14 @@ def main():
     parser.add_argument('--method', choices=['repos', 'search', 'both'], default='both',
                         help='Method: repos (check each repo), search (use GitHub search), or both')
     parser.add_argument('--repo-limit', type=int, default=20,
-                        help='Limit number of repositories to check (default: 20, most recent first)')
+                        help='Repositories to check from the most recently pushed '
+                             '(default: 20). Repositories that search says the user '
+                             'touched are checked on top of these.')
     parser.add_argument('--include-repos', type=str, default='',
-                        help='Comma-separated list of repos to always include (e.g., "docs-repo-name,wiki-repo-name")')
+                        help='Comma-separated repos to always include. Only needed for '
+                             'a repo where the user edits the wiki or comments on '
+                             'commits and does nothing else. Use the parent repo name, '
+                             'not the ".wiki" suffix, which is not a REST repository.')
     parser.add_argument('--verbose', action='store_true',
                         help='Show detailed progress messages during execution')
     parser.add_argument('--output', help='Output file to save results (JSON format)')
