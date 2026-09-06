@@ -9,6 +9,7 @@ Uses the GitHub CLI for simpler and more reliable API access.
 import subprocess
 import json
 import argparse
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Set, List, Dict
 import sys
@@ -38,14 +39,48 @@ class GitHubCLIActivityTracker:
             f"{username.title()} {username.title()}",  # If username is first name only
         ]
 
+    @staticmethod
+    def _normalise(text: str) -> str:
+        """Fold accents and drop separators, so 'Renée Dupont' -> 'reneedupont'."""
+        decomposed = unicodedata.normalize('NFKD', text or '')
+        stripped = ''.join(c for c in decomposed if not unicodedata.combining(c))
+        return ''.join(c for c in stripped.lower() if c.isalnum())
+
+    def _is_user_commit(self, login: str, author_name: str, author_email: str) -> bool:
+        """Decide whether a commit belongs to the tracked user.
+
+        GitHub resolves commits to an account itself and exposes it as
+        `.author.login`. When that is present it is authoritative: trust it and
+        stop. Matching on the git author name or email is a deliberate fallback
+        for the one case GitHub cannot resolve -- a commit whose author email is
+        not attached to any GitHub account -- and it is guesswork, so it is kept
+        deliberately narrow.
+        """
+        login = (login or '').strip()
+        if login:
+            return login.lower() == self.username.lower()
+
+        target = self._normalise(self.username)
+        author_email = (author_email or '').strip()
+        local_part = author_email.split('@')[0]
+        # GitHub noreply addresses look like "12345+username@users.noreply.github.com"
+        if '+' in local_part:
+            local_part = local_part.split('+', 1)[1]
+        if self._normalise(local_part) == target:
+            return True
+
+        return self._normalise(author_name) == target
+
     def get_month_date_range(self) -> tuple:
         """Get start and end dates for the specified month."""
         start_date = datetime(self.year, self.month, 1, tzinfo=timezone.utc)
 
+        # End of the month is the last *instant* of the last day. Subtracting a
+        # whole day here would silently drop everything after 00:00 on the 31st.
         if self.month == 12:
-            end_date = datetime(self.year + 1, 1, 1, tzinfo=timezone.utc) - timedelta(days=1)
+            end_date = datetime(self.year + 1, 1, 1, tzinfo=timezone.utc) - timedelta(microseconds=1)
         else:
-            end_date = datetime(self.year, self.month + 1, 1, tzinfo=timezone.utc) - timedelta(days=1)
+            end_date = datetime(self.year, self.month + 1, 1, tzinfo=timezone.utc) - timedelta(microseconds=1)
 
         return start_date, end_date
 
@@ -211,7 +246,7 @@ class GitHubCLIActivityTracker:
                 'gh', 'api', 
                 f'repos/{self.org}/{repo_name}/commits?per_page=100',
                 '--paginate',
-                '--jq', '.[] | {date: .commit.author.date, name: .commit.author.name, email: .commit.author.email, sha: .sha, message: .commit.message}'
+                '--jq', '.[] | {date: .commit.author.date, login: (.author.login // ""), name: .commit.author.name, email: .commit.author.email, sha: .sha, message: .commit.message}'
             ]
             
             result = self._run_gh_command(cmd, capture_output=True, text=True)
@@ -228,11 +263,9 @@ class GitHubCLIActivityTracker:
                             commit_sha = commit_data.get('sha', '')  # Full hash for deduplication
                             commit_message = commit_data.get('message', '').split('\n')[0][:60]  # First line, truncated
 
-                            # Check if this commit is by our user (any variation)
-                            is_user_commit = (
-                                author_name in self.username_variations or
-                                author_email.split('@')[0].lower() == self.username.lower() or
-                                self.username.lower() in author_name.lower()
+                            # Check if this commit is by our user
+                            is_user_commit = self._is_user_commit(
+                                commit_data.get('login', ''), author_name, author_email
                             )
 
                             if is_user_commit:
@@ -329,8 +362,12 @@ class GitHubCLIActivityTracker:
                             pr_number = pr_data['number']
                             updated_at = datetime.fromisoformat(pr_data['updated_at'].replace('Z', '+00:00'))
                             
-                            # Only check PRs updated in our date range
-                            if start_date <= updated_at <= end_date:
+                            # A PR reviewed during the month must have been
+                            # updated at or after the month started. Its last
+                            # update can be any time after that, so there is no
+                            # upper bound to apply here: capping it drops every
+                            # review on a PR that was touched again later.
+                            if updated_at >= start_date:
                                 review_days = self._get_reviews_for_pr(repo_name, pr_number, start_date, end_date)
                                 activity_days.update(review_days)
                                 
@@ -556,7 +593,7 @@ class GitHubCLIActivityTracker:
                 cmd = [
                     'gh', 'api', f'search/commits?q={encoded_query}',
                     '--paginate',
-                    '--jq', '.items[] | {date: .commit.author.date, sha: .sha, message: .commit.message, repo: .repository.name, author_name: .commit.author.name, author_email: .commit.author.email}'
+                    '--jq', '.items[] | {date: .commit.author.date, sha: .sha, message: .commit.message, repo: .repository.name, login: (.author.login // ""), author_name: .commit.author.name, author_email: .commit.author.email}'
                 ]
                 
                 result = self._run_gh_command(cmd, capture_output=True, text=True)
@@ -573,17 +610,16 @@ class GitHubCLIActivityTracker:
                                 # Skip if we've already seen this commit globally
                                 if commit_sha in self.seen_commits:
                                     continue
-                                self.seen_commits.add(commit_sha)
-                                
+
                                 # Verify the author actually matches our user (don't trust search API blindly!)
-                                is_user_commit = (
-                                    author_name in self.username_variations or
-                                    author_email.split('@')[0].lower() == self.username.lower() or
-                                    self.username.lower() in author_name.lower()
-                                )
-                                
-                                if not is_user_commit:
-                                    continue  # Skip commits that don't actually match our user
+                                if not self._is_user_commit(
+                                    commit_info.get('login', ''), author_name, author_email
+                                ):
+                                    # Do not mark it seen: this variation rejected it,
+                                    # another pass may still legitimately claim it.
+                                    continue
+
+                                self.seen_commits.add(commit_sha)
                                 
                                 commit_date = datetime.fromisoformat(commit_info['date'].replace('Z', '+00:00'))
                                 day_str = commit_date.strftime('%Y-%m-%d')
