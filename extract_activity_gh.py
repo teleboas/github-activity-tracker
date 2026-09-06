@@ -37,13 +37,6 @@ class GitHubCLIActivityTracker:
         self.comment_scans = {}
         # Calls that failed, so an incomplete report can say so
         self.failures = []
-        # Common variations of the username to search for
-        self.username_variations = [
-            username.lower(),
-            username,
-            username.title(),
-            f"{username.title()} {username.title()}",  # If username is first name only
-        ]
 
     @staticmethod
     def _normalise(text: str) -> str:
@@ -195,6 +188,76 @@ class GitHubCLIActivityTracker:
             self._record_failure("parsing the repository list", str(e))
             return []
 
+    def _get_commit_days_via_search(self, start_date: datetime, end_date: datetime) -> Set[str]:
+        """Get commit days from search, which preserves the author's UTC offset.
+
+        The REST commits endpoint normalises author dates to UTC, so work done
+        at 00:50+02:00 reads as the previous day. Search returns the original
+        offset, so it is the only source that can say which day the author was
+        actually working, and the day is therefore taken from the author's own
+        calendar rather than from UTC. Run this before the per-repository scan
+        so it claims commits first and that local day is the one recorded.
+        """
+        commit_days = set()
+        start_day = start_date.strftime('%Y-%m-%d')
+        end_day = end_date.strftime('%Y-%m-%d')
+        # author-date is the date this report counts by. One query is enough:
+        # author: matches the GitHub login, so name variations add nothing.
+        query = (f'org:{self.org} author:{self.username} '
+                 f'author-date:{start_day}..{end_day}')
+
+        try:
+            cmd = [
+                'gh', 'api', f'search/commits?q={quote_plus(query)}&per_page=100',
+                '--paginate',
+                '--jq', '.items[] | {date: .commit.author.date, sha: .sha, message: .commit.message, repo: .repository.name, login: (.author.login // ""), author_name: .commit.author.name, author_email: .commit.author.email}'
+            ]
+
+            result = self._run_gh_command(cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    if line and line != 'null':
+                        try:
+                            commit_info = json.loads(line)
+                            commit_sha = commit_info.get('sha', '')
+                            if commit_sha in self.seen_commits:
+                                continue
+
+                            # Verify the author really is our user (don't trust
+                            # the search API blindly)
+                            if not self._is_user_commit(
+                                commit_info.get('login', ''),
+                                commit_info.get('author_name', '').strip(),
+                                commit_info.get('author_email', '').strip()):
+                                continue
+
+                            commit_date = datetime.fromisoformat(commit_info['date'])
+                            day_str = commit_date.strftime('%Y-%m-%d')
+
+                            # Compare calendar days, not instants: the instant
+                            # of a late-night commit falls in the previous UTC
+                            # day and would be rejected at a month boundary.
+                            if not start_day <= day_str <= end_day:
+                                continue
+
+                            self.seen_commits.add(commit_sha)
+                            commit_days.add(day_str)
+                            message = commit_info.get('message', '').split('\n')[0][:60]
+                            self.add_activity(day_str, "Commit",
+                                              f"{commit_sha[:7]}: {message}",
+                                              commit_info.get('repo', 'unknown'))
+                        except (json.JSONDecodeError, KeyError, ValueError):
+                            continue
+
+            if self.verbose:
+                print(f"Found {len(commit_days)} days with commits via search")
+
+        except Exception as e:
+            self._record_failure("Commit search failed", str(e))
+
+        return commit_days
+
     def _get_active_repos(self, start_date: datetime, end_date: datetime) -> Set[str]:
         """Find repositories the user touched in the month, by search.
 
@@ -268,6 +331,11 @@ class GitHubCLIActivityTracker:
 
         if self.verbose:
             print(f"Checking {len(repos)} repositories in {self.org}")
+
+        # Claim commits from search first: it is the only source that keeps
+        # the author's UTC offset, and whichever pass sees a commit first
+        # decides which day it lands on.
+        activity_days.update(self._get_commit_days_via_search(start_date, end_date))
 
         for repo_name in repos:
             if self.verbose:
@@ -728,68 +796,10 @@ class GitHubCLIActivityTracker:
         if self.verbose:
             print(f"Using GitHub search for {self.username} activity in {self.org}")
         
-        # Search for commits using multiple author variations
-        commit_days = set()
-        
-        try:
-            # Try each username variation
-            for username_var in self.username_variations:
-                search_query = f'org:{self.org} author:"{username_var}" committer-date:{start_date.strftime("%Y-%m-%d")}..{end_date.strftime("%Y-%m-%d")}'
-                encoded_query = quote_plus(search_query)
-                
-                cmd = [
-                    'gh', 'api', f'search/commits?q={encoded_query}',
-                    '--paginate',
-                    '--jq', '.items[] | {date: .commit.author.date, sha: .sha, message: .commit.message, repo: .repository.name, login: (.author.login // ""), author_name: .commit.author.name, author_email: .commit.author.email}'
-                ]
-                
-                result = self._run_gh_command(cmd, capture_output=True, text=True)
-                
-                if result.returncode == 0:
-                    for line in result.stdout.strip().split('\n'):
-                        if line and line != 'null':
-                            try:
-                                commit_info = json.loads(line)
-                                commit_sha = commit_info.get('sha', '')
-                                author_name = commit_info.get('author_name', '').strip()
-                                author_email = commit_info.get('author_email', '').strip()
-                                
-                                # Skip if we've already seen this commit globally
-                                if commit_sha in self.seen_commits:
-                                    continue
+        # Commits come from the shared search pass, which keeps the author's
+        # UTC offset. See _get_commit_days_via_search.
+        activity_days.update(self._get_commit_days_via_search(start_date, end_date))
 
-                                # Verify the author actually matches our user (don't trust search API blindly!)
-                                if not self._is_user_commit(
-                                    commit_info.get('login', ''), author_name, author_email
-                                ):
-                                    # Do not mark it seen: this variation rejected it,
-                                    # another pass may still legitimately claim it.
-                                    continue
-
-                                self.seen_commits.add(commit_sha)
-                                
-                                commit_date = datetime.fromisoformat(commit_info['date'].replace('Z', '+00:00'))
-                                day_str = commit_date.strftime('%Y-%m-%d')
-                                
-                                # Double-check date range (search seems to have issues)
-                                if start_date <= commit_date <= end_date:
-                                    commit_days.add(day_str)
-                                    # Use short hash for display
-                                    short_sha = commit_sha[:7]
-                                    message = commit_info.get('message', '').split('\n')[0][:60]
-                                    repo_name = commit_info.get('repo', 'unknown')
-                                    self.add_activity(day_str, "Commit", f"{short_sha}: {message}", repo_name)
-                                    
-                            except (json.JSONDecodeError, KeyError):
-                                continue
-            
-            activity_days.update(commit_days)
-            if self.verbose:
-                print(f"Found {len(commit_days)} days with commits via search")
-            
-        except Exception as e:
-            self._record_failure(f"Commit search failed", str(e))
-        
         # Search for pull requests
         try:
             search_query = f"org:{self.org} author:{self.username} created:{start_date.strftime('%Y-%m-%d')}..{end_date.strftime('%Y-%m-%d')} type:pr"
