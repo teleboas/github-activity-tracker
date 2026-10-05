@@ -37,6 +37,10 @@ class GitHubCLIActivityTracker:
         self.comment_scans = {}
         # Calls that failed, so an incomplete report can say so
         self.failures = []
+        # Titles of issues and PRs, keyed by (repo, number), and first lines
+        # of commit messages, keyed by (repo, sha), so each is fetched once
+        self.titles = {}
+        self.commit_subjects = {}
 
     @staticmethod
     def _normalise(text: str) -> str:
@@ -154,7 +158,45 @@ class GitHubCLIActivityTracker:
                     else self._get_pr_comments_for_repo)
             self.comment_scans[key] = scan(repo_name, start_date, end_date)
         return self.comment_scans[key]
-    
+
+    def _remember_title(self, repo_name: str, number, title: str) -> None:
+        """Cache a title that a search or listing returned anyway."""
+        if title:
+            self.titles[(repo_name, int(number))] = title[:60]
+
+    def _item_title(self, repo_name: str, number) -> str:
+        """Title of an issue or pull request, fetched at most once per run.
+
+        Searches and listings carry titles and seed the cache, so a fetch is
+        needed only for an item the run met through a comment or review
+        alone. The issues endpoint serves both, as every pull request is also
+        an issue.
+        """
+        key = (repo_name, int(number))
+        if key not in self.titles:
+            cmd = ['gh', 'api', f'repos/{self.org}/{repo_name}/issues/{number}', '--jq', '.title']
+            result = self._run_gh_command(cmd, capture_output=True, text=True)
+            # _run_gh_command has already recorded a failed fetch. Keep the
+            # entry and mark it: the activity is real, only its title is lost.
+            if result.returncode == 0:
+                self.titles[key] = result.stdout.strip()[:60]
+            else:
+                self.titles[key] = '(title unavailable)'
+        return self.titles[key]
+
+    def _commit_subject(self, repo_name: str, sha: str) -> str:
+        """First line of a commit's message, fetched at most once per run."""
+        key = (repo_name, sha)
+        if key not in self.commit_subjects:
+            cmd = ['gh', 'api', f'repos/{self.org}/{repo_name}/commits/{sha}', '--jq', '.commit.message']
+            result = self._run_gh_command(cmd, capture_output=True, text=True)
+            # As in _item_title, a failure is already recorded.
+            if result.returncode == 0:
+                self.commit_subjects[key] = result.stdout.strip().split('\n')[0][:60]
+            else:
+                self.commit_subjects[key] = '(message unavailable)'
+        return self.commit_subjects[key]
+
     def add_activity(self, date_str: str, activity_type: str, details: str, repo: str = None):
         """Add detailed activity for a specific date."""
         repo_str = f" in {repo}" if repo else ""
@@ -532,6 +574,7 @@ class GitHubCLIActivityTracker:
                         day_str = pr_date.strftime('%Y-%m-%d')
                         activity_days.add(day_str)
                         pr_title = pr.get('title', 'Untitled')[:60]
+                        self._remember_title(repo_name, pr_number, pr_title)
                         self.add_activity(day_str, "PR Created", f"#{pr_number}: {pr_title}", repo_name)
             
         except subprocess.CalledProcessError:
@@ -564,7 +607,7 @@ class GitHubCLIActivityTracker:
             cmd = [
                 'gh', 'api', f'search/issues?q={quote_plus(query)}&per_page=100',
                 '--paginate',
-                '--jq', '.items[] | {number: .number, repo: .repository_url}'
+                '--jq', '.items[] | {number: .number, title: .title, repo: .repository_url}'
             ]
 
             result = self._run_gh_command(cmd, capture_output=True, text=True)
@@ -578,6 +621,7 @@ class GitHubCLIActivityTracker:
                             if not repo_url:
                                 continue
                             repo_name = repo_url.split('/')[-1]
+                            self._remember_title(repo_name, item['number'], item.get('title'))
                             review_days = self._get_reviews_for_pr(
                                 repo_name, item['number'], start_date, end_date)
                             activity_days.update(review_days)
@@ -619,7 +663,9 @@ class GitHubCLIActivityTracker:
                                 if start_date <= review_date <= end_date:
                                     day_str = review_date.strftime('%Y-%m-%d')
                                     review_days.add(day_str)
-                                    self.add_activity(day_str, "PR Review", f"on PR #{pr_number}", repo_name)
+                                    self.add_activity(day_str, "PR Review",
+                                                      f"on PR #{pr_number}: {self._item_title(repo_name, pr_number)}",
+                                                      repo_name)
                                     
                         except (json.JSONDecodeError, KeyError):
                             continue
@@ -659,6 +705,7 @@ class GitHubCLIActivityTracker:
                         day_str = issue_date.strftime('%Y-%m-%d')
                         activity_days.add(day_str)
                         issue_title = issue.get('title', 'Untitled')[:60]
+                        self._remember_title(repo_name, issue_number, issue_title)
                         self.add_activity(day_str, "Issue Created", f"#{issue_number}: {issue_title}", repo_name)
 
         except subprocess.CalledProcessError:
@@ -698,7 +745,9 @@ class GitHubCLIActivityTracker:
                                     # Extract issue number from URL
                                     issue_url = comment_data.get('issue_url', '')
                                     issue_number = issue_url.split('/')[-1] if issue_url else 'unknown'
-                                    self.add_activity(day_str, "Issue Comment", f"on issue #{issue_number}", repo_name)
+                                    title = self._item_title(repo_name, issue_number)
+                                    self.add_activity(day_str, "Issue Comment",
+                                                      f"on issue #{issue_number}: {title}", repo_name)
                         except (json.JSONDecodeError, KeyError):
                             continue
 
@@ -739,7 +788,9 @@ class GitHubCLIActivityTracker:
                                     # Extract PR number from URL
                                     pr_url = comment_data.get('pull_request_url', '')
                                     pr_number = pr_url.split('/')[-1] if pr_url else 'unknown'
-                                    self.add_activity(day_str, "PR Comment", f"on PR #{pr_number}", repo_name)
+                                    title = self._item_title(repo_name, pr_number)
+                                    self.add_activity(day_str, "PR Comment",
+                                                      f"on PR #{pr_number}: {title}", repo_name)
                         except (json.JSONDecodeError, KeyError):
                             continue
 
@@ -773,8 +824,10 @@ class GitHubCLIActivityTracker:
                                 if start_date <= comment_date <= end_date:
                                     day_str = comment_date.strftime('%Y-%m-%d')
                                     activity_days.add(day_str)
-                                    commit_id = comment_data.get('commit_id', 'unknown')[:7]
-                                    self.add_activity(day_str, "Commit Comment", f"on commit {commit_id}", repo_name)
+                                    commit_id = comment_data['commit_id']
+                                    subject = self._commit_subject(repo_name, commit_id)
+                                    self.add_activity(day_str, "Commit Comment",
+                                                      f"on commit {commit_id[:7]}: {subject}", repo_name)
                         except (json.JSONDecodeError, KeyError):
                             continue
 
@@ -835,6 +888,7 @@ class GitHubCLIActivityTracker:
                                 day_str = pr_date.strftime('%Y-%m-%d')
                                 pr_days.add(day_str)
                                 pr_title = pr_info.get('title', 'Untitled')[:60]
+                                self._remember_title(repo_name, pr_number, pr_title)
                                 self.add_activity(day_str, "PR Created", f"#{pr_number}: {pr_title}", repo_name)
                         except (json.JSONDecodeError, KeyError):
                             continue
@@ -875,6 +929,7 @@ class GitHubCLIActivityTracker:
                                 day_str = issue_date.strftime('%Y-%m-%d')
                                 issue_days.add(day_str)
                                 issue_title = issue_info.get('title', 'Untitled')[:60]
+                                self._remember_title(repo_name, issue_number, issue_title)
                                 self.add_activity(day_str, "Issue Created", f"#{issue_number}: {issue_title}", repo_name)
                         except (json.JSONDecodeError, KeyError):
                             continue
@@ -894,7 +949,7 @@ class GitHubCLIActivityTracker:
             cmd = [
                 'gh', 'api', f'search/issues?q={encoded_query}',
                 '--paginate',
-                '--jq', '.items[] | {number: .number, repo: .repository_url, updated_at: .updated_at, is_pr: .pull_request}'
+                '--jq', '.items[] | {number: .number, title: .title, repo: .repository_url, updated_at: .updated_at, is_pr: .pull_request}'
             ]
 
             result = self._run_gh_command(cmd, capture_output=True, text=True)
@@ -909,6 +964,7 @@ class GitHubCLIActivityTracker:
                             repo_url = item_info.get('repo', '')
                             repo_name = repo_url.split('/')[-1] if repo_url else 'unknown'
                             is_pr = item_info.get('is_pr') is not None
+                            self._remember_title(repo_name, item_number, item_info.get('title'))
 
                             # Fetch comments for this issue/PR. The scans are
                             # per repository, so many search hits collapse onto

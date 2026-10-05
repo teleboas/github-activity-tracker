@@ -89,11 +89,11 @@ Detailed daily activity:
     - Commit: abc1234: Fix bug in authentication in repo-name
     - PR Created: #123: Add new feature in repo-name
   2025-08-03:
-    - PR Review: on PR #124 in repo-name
-    - Issue Comment: on issue #125 in repo-name
+    - PR Review: on PR #124: Add rate limiting in repo-name
+    - Issue Comment: on issue #125: Login fails on Safari in repo-name
     - Wiki Edit: edited 'API Documentation' in docs-repo-name
   2025-08-07:
-    - PR Comment: on PR #126 in repo-name
+    - PR Comment: on PR #126: Refactor config loading in repo-name
     - Commit: def5678: Update dependencies in repo-name
   ...
 ```
