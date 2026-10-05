@@ -35,6 +35,9 @@ class GitHubCLIActivityTracker:
         self.gh_command_count = 0    # gh subprocesses spawned
         # Per-repo comment scans already done in this run, keyed by (kind, repo)
         self.comment_scans = {}
+        # Review days, once looked up. Both methods need them, and the lookup
+        # costs a request per reviewed PR.
+        self.review_days = None
         # Calls that failed, so an incomplete report can say so
         self.failures = []
         # Titles of issues and PRs, keyed by (repo, number), and first lines
@@ -598,6 +601,9 @@ class GitHubCLIActivityTracker:
         review on, which is a far smaller set and does not grow with
         unrelated activity.
         """
+        if self.review_days is not None:
+            return self.review_days
+
         activity_days = set()
         since = start_date.strftime('%Y-%m-%d')
         query = (f'org:{self.org} type:pr reviewed-by:{self.username} '
@@ -636,6 +642,7 @@ class GitHubCLIActivityTracker:
         except Exception as e:
             self._record_failure(f"Error checking PR reviews", str(e))
 
+        self.review_days = activity_days
         return activity_days
 
     def _get_reviews_for_pr(self, repo_name: str, pr_number: int, start_date: datetime, end_date: datetime) -> Set[str]:
@@ -969,14 +976,15 @@ class GitHubCLIActivityTracker:
                             # Fetch comments for this issue/PR. The scans are
                             # per repository, so many search hits collapse onto
                             # one scan each.
+                            #
+                            # A comment in a PR's conversation is an issue
+                            # comment, so every hit needs the issue scan. A PR
+                            # also needs the scan for review comments on code.
+                            issue_comment_days = self._scan_repo_comments('issue', repo_name, start_date, end_date)
+                            activity_days.update(issue_comment_days)
                             if is_pr:
-                                # Check PR review comments
                                 pr_comment_days = self._scan_repo_comments('pr', repo_name, start_date, end_date)
                                 activity_days.update(pr_comment_days)
-                            else:
-                                # Check issue comments
-                                issue_comment_days = self._scan_repo_comments('issue', repo_name, start_date, end_date)
-                                activity_days.update(issue_comment_days)
 
                         except (json.JSONDecodeError, KeyError):
                             continue
@@ -986,6 +994,10 @@ class GitHubCLIActivityTracker:
 
         except Exception as e:
             self._record_failure(f"Comment search failed", str(e))
+
+        # Reviews come from search already, so this method needs them as much
+        # as the repository method does.
+        activity_days.update(self._get_review_days(start_date, end_date))
 
         return activity_days
 
